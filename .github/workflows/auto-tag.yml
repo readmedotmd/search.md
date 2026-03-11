@@ -1,0 +1,45 @@
+name: Auto Tag
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate alpha tag
+        run: |
+          # Get latest semver tag (manual bumps only)
+          LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -v '-' | head -1)
+          if [ -z "$LATEST" ]; then
+            LATEST="v0.0.0"
+          fi
+
+          # Count commits since that tag
+          if git rev-parse "$LATEST" >/dev/null 2>&1; then
+            COUNT=$(git rev-list "${LATEST}..HEAD" --count)
+          else
+            COUNT=$(git rev-list HEAD --count)
+          fi
+
+          # Skip if this commit already has the base semver tag
+          if [ "$COUNT" -eq 0 ]; then
+            echo "HEAD is already tagged $LATEST, skipping"
+            exit 0
+          fi
+
+          SHORT=$(git rev-parse --short HEAD)
+          ALPHA_TAG="${LATEST}-alpha.${COUNT}.${SHORT}"
+
+          echo "Tagging $ALPHA_TAG"
+          git tag "$ALPHA_TAG"
+          git push origin "$ALPHA_TAG"

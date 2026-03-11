@@ -1,10 +1,9 @@
 name: Generate Banner
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '.github/banner.svg'
+  workflow_run:
+    workflows: ["Auto Tag"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -12,9 +11,12 @@ permissions:
 jobs:
   generate:
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: ${{ github.event.workflow_run.conclusion == 'success' && !contains(github.event.workflow_run.head_commit.message, '[skip ci]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Extract version
         id: version
