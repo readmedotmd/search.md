@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://faas-lon1-917a94a7.doserverless.co/api/v1/web/fn-38e8948f-7a79-4b9d-af0e-f6399470d7be/generate/svg?type=root" alt="search.md" />
+</p>
+
 # search.md
 
 Full-text search for Go. One dependency. Zero config.
