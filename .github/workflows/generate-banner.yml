@@ -27,7 +27,7 @@ jobs:
           GENERATE_URL: ${{ secrets.STYLEMD_GENERATE_URL }}
           API_KEY: ${{ secrets.STYLEMD_API_KEY }}
           REPO_NAME: ${{ github.event.repository.name }}
-          REPO_DESC: ${{ github.event.repository.description }}
+          REPO_DESC: ${{ github.event.repository.description || 'Full-text search for Go. One dependency. Zero config.' }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p .github
@@ -35,7 +35,9 @@ jobs:
             --data-urlencode "api_key=$API_KEY" \
             --data-urlencode "name=$REPO_NAME" \
             --data-urlencode "tagline=$REPO_DESC" \
+            --data-urlencode "desc=$REPO_DESC" \
             --data-urlencode "version=$VERSION" \
+            --data-urlencode "tags=go,search,bm25,full-text,store.md" \
             -o .github/banner.svg
 
       - name: Commit banner
