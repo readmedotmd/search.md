@@ -16,11 +16,12 @@
 //
 // Every indexed file produces a document with these metadata fields:
 //
-//   - path     (keyword) — relative path from the watched root (e.g., "src/main.go")
-//   - filename (keyword) — base file name (e.g., "main.go")
-//   - ext      (keyword) — file extension without dot (e.g., "go")
-//   - size     (numeric) — file size in bytes
-//   - modified (datetime) — last modification time in RFC 3339
+//   - path          (keyword)  — relative path from the watched root (e.g., "src/main.go")
+//   - filename      (keyword)  — base file name for exact matching (e.g., "main.go")
+//   - filename_text (text)     — base file name analyzed for partial/fuzzy search
+//   - ext           (keyword)  — file extension without dot (e.g., "go")
+//   - size          (numeric)  — file size in bytes
+//   - modified      (datetime) — last modification time in RFC 3339
 //
 // Additional fields are added based on the enabled modes (see above).
 //

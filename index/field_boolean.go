@@ -23,15 +23,15 @@ func (fi *BooleanFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 	}
 	posting := Posting{DocID: docID, Frequency: 1, Norm: 1.0}
 	postingJSON, _ := json.Marshal(posting)
-	key := prefixTerm + field.Name + "/" + termVal + "/" + docID
+	key := termKey(field.Name, termVal, docID)
 	if err := store.Set(key, string(postingJSON)); err != nil {
 		return nil, err
 	}
 	if err := helpers.IncrementDocFreq(field.Name, termVal); err != nil {
 		return nil, err
 	}
-	boolKey := prefixBool + field.Name + "/" + docID
-	if err := store.Set(boolKey, termVal); err != nil {
+	bk := boolKey(field.Name, docID)
+	if err := store.Set(bk, termVal); err != nil {
 		return nil, err
 	}
 	return &RevIdxEntry{Field: field.Name, Type: "bool", Terms: []string{termVal}}, nil
@@ -40,14 +40,14 @@ func (fi *BooleanFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 func (fi *BooleanFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
 	store := helpers.Store()
 	for _, term := range entry.Terms {
-		if err := deleteKey(store, prefixTerm+entry.Field+"/"+term+"/"+docID); err != nil {
+		if err := deleteKey(store, termKey(entry.Field, term, docID)); err != nil {
 			return err
 		}
 		if err := helpers.DecrementDocFreq(entry.Field, term); err != nil {
 			return err
 		}
 	}
-	if err := deleteKey(store, prefixBool+entry.Field+"/"+docID); err != nil {
+	if err := deleteKey(store, boolKey(entry.Field, docID)); err != nil {
 		return err
 	}
 	return nil

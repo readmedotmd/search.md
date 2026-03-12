@@ -177,7 +177,7 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 	if err != nil {
 		return fmt.Errorf("marshal document: %w", err)
 	}
-	if err := idx.store.Set(prefixDoc+doc.ID, string(docJSON)); err != nil {
+	if err := idx.store.Set(docKey(doc.ID), string(docJSON)); err != nil {
 		return fmt.Errorf("store document: %w", err)
 	}
 
@@ -213,14 +213,17 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 		if err != nil {
 			return fmt.Errorf("marshal reverse index: %w", err)
 		}
-		if err := idx.store.Set(prefixRevIdx+doc.ID, string(riJSON)); err != nil {
+		if err := idx.store.Set(revIdxKey(doc.ID), string(riJSON)); err != nil {
 			return fmt.Errorf("store reverse index: %w", err)
 		}
 	}
 
 	// Only increment document count for new documents
 	if !existed {
-		count, _ := idx.getDocCount() // error intentionally ignored; 0 is acceptable fallback
+		count, err := idx.getDocCount()
+		if err != nil {
+			return fmt.Errorf("get doc count: %w", err)
+		}
 		if err := idx.store.Set(keyDocCount, strconv.FormatUint(count+1, 10)); err != nil {
 			return fmt.Errorf("update doc count: %w", err)
 		}
@@ -239,7 +242,10 @@ func (idx *Index) DeleteDocument(docID string) error {
 		return err
 	}
 	if existed {
-		count, _ := idx.getDocCount() // error intentionally ignored; 0 is acceptable fallback
+		count, err := idx.getDocCount()
+		if err != nil {
+			return fmt.Errorf("get doc count: %w", err)
+		}
 		if count > 0 {
 			if err := idx.store.Set(keyDocCount, strconv.FormatUint(count-1, 10)); err != nil {
 				return fmt.Errorf("update doc count: %w", err)
@@ -251,25 +257,25 @@ func (idx *Index) DeleteDocument(docID string) error {
 
 func (idx *Index) deleteDocInternal(docID string) (bool, error) {
 	// Check if document exists
-	_, err := idx.store.Get(prefixDoc + docID)
+	_, err := idx.store.Get(docKey(docID))
 	if err != nil {
 		return false, nil
 	}
 
 	// Delete document data
-	if err := deleteKey(idx.store, prefixDoc+docID); err != nil {
+	if err := deleteKey(idx.store, docKey(docID)); err != nil {
 		return false, fmt.Errorf("delete document data: %w", err)
 	}
 
 	// Try targeted deletion using the reverse index
-	riVal, riErr := idx.store.Get(prefixRevIdx + docID)
+	riVal, riErr := idx.store.Get(revIdxKey(docID))
 	if riErr == nil {
 		var entries []RevIdxEntry
 		if json.Unmarshal([]byte(riVal), &entries) == nil {
 			if err := idx.deleteDocWithRevIdx(docID, entries); err != nil {
 				return false, err
 			}
-			if err := deleteKey(idx.store, prefixRevIdx+docID); err != nil {
+			if err := deleteKey(idx.store, revIdxKey(docID)); err != nil {
 				return false, fmt.Errorf("delete reverse index: %w", err)
 			}
 			return true, nil
@@ -353,8 +359,8 @@ func (idx *Index) deleteDocFullScan(docID string) error {
 			parts := strings.SplitN(strings.TrimPrefix(key, prefixFieldLen), "/", 2)
 			if len(parts) == 2 {
 				fieldLen, _ := strconv.Atoi(value)
-				sumKey := prefixFieldLenSum + parts[0]
-				currentSum, _ := idx.getInt64(sumKey) // error intentionally ignored; 0 is acceptable fallback
+				sumKey := fieldLenSumKey(parts[0])
+				currentSum, _ := idx.getInt64(sumKey)
 				newSum := currentSum - int64(fieldLen)
 				if newSum < 0 {
 					newSum = 0
@@ -449,7 +455,7 @@ func (idx *Index) GetDocument(docID string) (*document.StoredData, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	val, err := idx.store.Get(prefixDoc + docID)
+	val, err := idx.store.Get(docKey(docID))
 	if err != nil {
 		return nil, fmt.Errorf("document not found: %s", docID)
 	}
@@ -483,7 +489,7 @@ func (idx *Index) TermPostings(field, term string) ([]Posting, error) {
 }
 
 func (idx *Index) termPostings(field, term string) ([]Posting, error) {
-	prefix := prefixTerm + field + "/" + term + "/"
+	prefix := termFieldPrefix(field, term)
 	results, err := idx.store.List(storemd.ListArgs{Prefix: prefix})
 	if err != nil {
 		return nil, err
@@ -509,7 +515,7 @@ func (idx *Index) TermsForField(field string) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixTerm + field + "/"
+	prefix := termFieldOnlyPrefix(field)
 	termSet := make(map[string]struct{})
 	startAfter := ""
 
@@ -555,9 +561,9 @@ func (idx *Index) TermsWithPrefix(field, termPrefix string) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixTerm + field + "/" + termPrefix
+	prefix := termFieldOnlyPrefix(field) + termPrefix
 	termSet := make(map[string]struct{})
-	fieldPrefix := prefixTerm + field + "/"
+	fieldPrefix := termFieldOnlyPrefix(field)
 	startAfter := ""
 
 	for {
@@ -604,7 +610,7 @@ func (idx *Index) DocumentFrequency(field, term string) (uint64, error) {
 }
 
 func (idx *Index) docFreq(field, term string) (uint64, error) {
-	key := prefixDocFreq + field + "/" + term
+	key := docFreqKey(field, term)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return 0, nil
@@ -617,13 +623,13 @@ func (idx *Index) docFreq(field, term string) (uint64, error) {
 }
 
 func (idx *Index) incrementDocFreq(field, term string) error {
-	key := prefixDocFreq + field + "/" + term
+	key := docFreqKey(field, term)
 	count, _ := idx.docFreq(field, term) // error intentionally ignored; 0 is acceptable fallback
 	return idx.store.Set(key, strconv.FormatUint(count+1, 10))
 }
 
 func (idx *Index) decrementDocFreq(field, term string) error {
-	key := prefixDocFreq + field + "/" + term
+	key := docFreqKey(field, term)
 	count, _ := idx.docFreq(field, term) // error intentionally ignored; 0 is acceptable fallback
 	if count <= 1 {
 		return deleteKey(idx.store, key)
@@ -633,7 +639,7 @@ func (idx *Index) decrementDocFreq(field, term string) error {
 
 // FieldLength returns the length (token count) of a field in a document.
 func (idx *Index) FieldLength(field, docID string) (int, error) {
-	key := prefixFieldLen + field + "/" + docID
+	key := fieldLenKey(field, docID)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return 0, nil
@@ -649,9 +655,15 @@ func (idx *Index) AverageFieldLength(field string) (float64, error) {
 }
 
 func (idx *Index) avgFieldLength(field string) (float64, error) {
-	sumKey := prefixFieldLenSum + field
-	sum, _ := idx.getInt64(sumKey) // error intentionally ignored; 0 is acceptable fallback
-	count, _ := idx.getDocCount()  // error intentionally ignored; 0 is acceptable fallback
+	sumKey := fieldLenSumKey(field)
+	sum, err := idx.getInt64(sumKey)
+	if err != nil {
+		return 0, fmt.Errorf("get field length sum for %q: %w", field, err)
+	}
+	count, err := idx.getDocCount()
+	if err != nil {
+		return 0, fmt.Errorf("get doc count: %w", err)
+	}
 	if count == 0 {
 		return 0, nil
 	}
@@ -675,7 +687,7 @@ func (idx *Index) GetTermVector(field, docID, term string) (*TermVector, error) 
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	key := prefixTermVec + field + "/" + docID + "/" + term
+	key := termVecKey(field, docID, term)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return nil, err
@@ -692,7 +704,7 @@ func (idx *Index) GetVector(field, docID string) ([]float32, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	key := prefixVector + field + "/" + docID
+	key := vectorKey(field, docID)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return nil, err
@@ -709,7 +721,7 @@ func (idx *Index) AllVectors(field string) (map[string][]float32, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixVector + field + "/"
+	prefix := vectorFieldPrefix(field)
 	results, err := idx.store.List(storemd.ListArgs{Prefix: prefix})
 	if err != nil {
 		return nil, err
@@ -733,7 +745,7 @@ func (idx *Index) ForEachVector(field string, fn func(docID string, vec []float3
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixVector + field + "/"
+	prefix := vectorFieldPrefix(field)
 	const batchSize = 256
 	startAfter := ""
 
@@ -811,7 +823,7 @@ func (idx *Index) NumericRange(field string, min, max *float64) ([]string, error
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixNumeric + field + "/"
+	prefix := numericFieldPrefix(field)
 	var docIDs []string
 	startAfter := ""
 	for {
@@ -853,7 +865,7 @@ func (idx *Index) DateTimeRange(field string, start, end *time.Time) ([]string, 
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := prefixDateTime + field + "/"
+	prefix := dateTimeFieldPrefix(field)
 	var docIDs []string
 	startAfter := ""
 	for {
@@ -903,7 +915,8 @@ func (idx *Index) AllDocIDs() ([]string, error) {
 
 	docIDs := make([]string, 0, len(results))
 	for _, kv := range results {
-		docIDs = append(docIDs, strings.TrimPrefix(kv.Key, prefixDoc))
+		id := strings.TrimPrefix(kv.Key, prefixDoc)
+		docIDs = append(docIDs, id)
 	}
 	return docIDs, nil
 }
@@ -916,7 +929,7 @@ func (idx *Index) ListDocIDs(startAfter string, limit int) ([]string, error) {
 
 	storeStartAfter := ""
 	if startAfter != "" {
-		storeStartAfter = prefixDoc + startAfter
+		storeStartAfter = docKey(startAfter)
 	}
 
 	results, err := idx.store.List(storemd.ListArgs{
@@ -930,14 +943,15 @@ func (idx *Index) ListDocIDs(startAfter string, limit int) ([]string, error) {
 
 	docIDs := make([]string, 0, len(results))
 	for _, kv := range results {
-		docIDs = append(docIDs, strings.TrimPrefix(kv.Key, prefixDoc))
+		id := strings.TrimPrefix(kv.Key, prefixDoc)
+		docIDs = append(docIDs, id)
 	}
 	return docIDs, nil
 }
 
 // GetNumericValue returns the numeric value for a field in a document.
 func (idx *Index) GetNumericValue(field, docID string) (float64, bool) {
-	key := prefixNumeric + field + "/" + docID
+	key := numericKey(field, docID)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return 0, false
@@ -951,7 +965,7 @@ func (idx *Index) GetNumericValue(field, docID string) (float64, bool) {
 
 // GetDateTimeValue returns the datetime value for a field in a document.
 func (idx *Index) GetDateTimeValue(field, docID string) (time.Time, bool) {
-	key := prefixDateTime + field + "/" + docID
+	key := dateTimeKey(field, docID)
 	val, err := idx.store.Get(key)
 	if err != nil {
 		return time.Time{}, false

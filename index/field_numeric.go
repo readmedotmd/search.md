@@ -16,7 +16,7 @@ func (fi *NumericFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 	if !ok {
 		return nil, nil
 	}
-	key := prefixNumeric + field.Name + "/" + docID
+	key := numericKey(field.Name, docID)
 	if err := helpers.Store().Set(key, strconv.FormatFloat(val, 'g', -1, 64)); err != nil {
 		return nil, err
 	}
@@ -24,5 +24,5 @@ func (fi *NumericFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 }
 
 func (fi *NumericFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
-	return deleteKey(helpers.Store(), prefixNumeric+entry.Field+"/"+docID)
+	return deleteKey(helpers.Store(), numericKey(entry.Field, docID))
 }

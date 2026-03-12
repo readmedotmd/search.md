@@ -174,71 +174,98 @@ func (e *TreeSitterExtractor) Extract(source []byte, language string) ([]Symbol,
 		ruleMap[r.NodeType] = r
 	}
 
-	root.Walk(func(node *ASTNode) bool {
-		rule, ok := ruleMap[node.Type]
-		if !ok {
-			return true
+	// Collect all scope-providing node types across all rules so we know
+	// which ancestor types to track on the scope stack.
+	scopeNameFields := make(map[string]string) // nodeType -> nameField
+	for _, r := range rules {
+		for _, pt := range r.ScopeParentTypes {
+			if _, exists := scopeNameFields[pt]; !exists {
+				scopeNameFields[pt] = r.ScopeNameField
+			}
 		}
-
-		nameNode := node.ChildByFieldName(rule.NameField)
-		if nameNode == nil {
-			return true
-		}
-
-		sym := Symbol{
-			Name:      nameNode.Content,
-			Kind:      rule.Kind,
-			Language:  language,
-			Line:      int(node.StartRow) + 1,
-			StartByte: int(node.StartByte),
-			EndByte:   int(node.EndByte),
-		}
-
-		// Find scope from parent nodes.
-		if len(rule.ScopeParentTypes) > 0 {
-			sym.Scope = findScope(root, node, rule.ScopeParentTypes, rule.ScopeNameField)
-		}
-
-		symbols = append(symbols, sym)
-		return true
-	})
-
-	return symbols, nil
-}
-
-// findScope searches ancestors for a scope-providing node.
-// Since ASTNode doesn't store parent references, we walk from root to find the scope.
-func findScope(root, target *ASTNode, parentTypes []string, nameField string) string {
-	parentTypeSet := make(map[string]bool)
-	for _, pt := range parentTypes {
-		parentTypeSet[pt] = true
 	}
 
-	var scope string
-	root.Walk(func(node *ASTNode) bool {
-		if parentTypeSet[node.Type] {
-			if nameNode := node.ChildByFieldName(nameField); nameNode != nil {
-				// Check if target is a descendant of this node.
-				if containsNode(node, target) {
-					scope = nameNode.Content
+	// Use an iterative DFS with a scope stack instead of Walk + findScope
+	// so that scope resolution is O(1) per symbol instead of O(tree_nodes).
+	type frame struct {
+		node       *ASTNode
+		childIndex int
+	}
+	type scopeEntry struct {
+		nodeType string
+		name     string
+	}
+
+	stack := []frame{{node: root, childIndex: 0}}
+	var scopeStack []scopeEntry
+
+	for len(stack) > 0 {
+		top := &stack[len(stack)-1]
+
+		if top.childIndex == 0 {
+			// First visit to this node: process it.
+			node := top.node
+
+			// Push scope if this node is a scope-providing type.
+			if nameField, isScopeType := scopeNameFields[node.Type]; isScopeType {
+				scopeName := ""
+				if nameNode := node.ChildByFieldName(nameField); nameNode != nil {
+					scopeName = nameNode.Content
+				}
+				scopeStack = append(scopeStack, scopeEntry{nodeType: node.Type, name: scopeName})
+			}
+
+			// Extract symbol if this node matches a rule.
+			if rule, ok := ruleMap[node.Type]; ok {
+				nameNode := node.ChildByFieldName(rule.NameField)
+				if nameNode != nil {
+					sym := Symbol{
+						Name:      nameNode.Content,
+						Kind:      rule.Kind,
+						Language:  language,
+						Line:      int(node.StartRow) + 1,
+						StartByte: int(node.StartByte),
+						EndByte:   int(node.EndByte),
+					}
+
+					// Resolve scope from the stack in O(1) amortized.
+					if len(rule.ScopeParentTypes) > 0 {
+						parentTypeSet := make(map[string]bool, len(rule.ScopeParentTypes))
+						for _, pt := range rule.ScopeParentTypes {
+							parentTypeSet[pt] = true
+						}
+						// Walk the scope stack top-down to find the nearest matching scope.
+						for i := len(scopeStack) - 1; i >= 0; i-- {
+							if parentTypeSet[scopeStack[i].nodeType] {
+								sym.Scope = scopeStack[i].name
+								break
+							}
+						}
+					}
+
+					symbols = append(symbols, sym)
+					if len(symbols) >= maxSymbolsPerFile {
+						return symbols, nil
+					}
 				}
 			}
 		}
-		return true
-	})
-	return scope
-}
 
-func containsNode(parent, target *ASTNode) bool {
-	if parent == target {
-		return true
-	}
-	for _, child := range parent.Children {
-		if containsNode(child, target) {
-			return true
+		// Advance to the next child, or pop if done.
+		if top.childIndex < len(top.node.Children) {
+			child := top.node.Children[top.childIndex]
+			top.childIndex++
+			stack = append(stack, frame{node: child, childIndex: 0})
+		} else {
+			// Leaving this node: pop scope if we pushed one.
+			if _, isScopeType := scopeNameFields[top.node.Type]; isScopeType {
+				scopeStack = scopeStack[:len(scopeStack)-1]
+			}
+			stack = stack[:len(stack)-1]
 		}
 	}
-	return false
+
+	return symbols, nil
 }
 
 // defaultExtractionRules returns built-in extraction rules for common languages.

@@ -662,6 +662,9 @@ func TestScan_MetadataFields(t *testing.T) {
 	if doc["filename"] != "app.go" {
 		t.Errorf("filename = %v, want app.go", doc["filename"])
 	}
+	if doc["filename_text"] != "app.go" {
+		t.Errorf("filename_text = %v, want app.go", doc["filename_text"])
+	}
 	if doc["ext"] != "go" {
 		t.Errorf("ext = %v, want go", doc["ext"])
 	}
@@ -741,6 +744,57 @@ func TestScan_FTSSearchQuery(t *testing.T) {
 	}
 	if results.Total != 2 {
 		t.Errorf("expected 2 results for ext 'txt', got %d", results.Total)
+	}
+}
+
+func TestScan_FilenameTextSearch(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "server_utils.go", "package utils")
+	writeFile(t, dir, "server_handler.go", "package handler")
+	writeFile(t, dir, "client.go", "package client")
+
+	store := newMemStore()
+	m := fswatcher.IndexMapping(fswatcher.WithFTS())
+	idx, err := searchmd.New(store, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := fswatcher.New(idx, dir, fswatcher.WithFTS())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Partial match on analyzed filename_text should find both server files.
+	results, err := idx.Search(ctx, query.NewMatchQuery("server").SetField("filename_text"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results.Total != 2 {
+		t.Errorf("expected 2 results for 'server' in filename_text, got %d", results.Total)
+	}
+
+	// Exact keyword match on filename should find only exact name.
+	results, err = idx.Search(ctx, query.NewTermQuery("client.go").SetField("filename"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results.Total != 1 {
+		t.Errorf("expected 1 result for exact filename 'client.go', got %d", results.Total)
+	}
+
+	// Partial keyword match should NOT work on the keyword field.
+	results, err = idx.Search(ctx, query.NewTermQuery("server").SetField("filename"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results.Total != 0 {
+		t.Errorf("expected 0 results for partial keyword 'server' on filename, got %d", results.Total)
 	}
 }
 

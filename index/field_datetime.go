@@ -16,7 +16,7 @@ func (fi *DateTimeFieldIndexer) IndexField(helpers IndexHelpers, docID string, f
 	if !ok {
 		return nil, nil
 	}
-	key := prefixDateTime + field.Name + "/" + docID
+	key := dateTimeKey(field.Name, docID)
 	if err := helpers.Store().Set(key, strconv.FormatInt(t.UnixNano(), 10)); err != nil {
 		return nil, err
 	}
@@ -24,5 +24,5 @@ func (fi *DateTimeFieldIndexer) IndexField(helpers IndexHelpers, docID string, f
 }
 
 func (fi *DateTimeFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
-	return deleteKey(helpers.Store(), prefixDateTime+entry.Field+"/"+docID)
+	return deleteKey(helpers.Store(), dateTimeKey(entry.Field, docID))
 }

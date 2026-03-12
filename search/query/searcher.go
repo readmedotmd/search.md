@@ -33,7 +33,7 @@ type termSearcher struct {
 func newTermSearcher(reader plugin.IndexReader, field, term string, boost float64, sf plugin.ScorerFactory) (*termSearcher, error) {
 	postings, err := reader.TermPostings(field, term)
 	if err != nil {
-		return &termSearcher{}, nil
+		return nil, err
 	}
 
 	docCount, _ := reader.DocCount()
@@ -423,7 +423,7 @@ type numericRangeSearcher struct {
 func newNumericRangeSearcher(reader plugin.IndexReader, field string, min, max *float64, boost float64) (*numericRangeSearcher, error) {
 	docIDs, err := reader.NumericRange(field, min, max)
 	if err != nil {
-		return &numericRangeSearcher{}, nil
+		return nil, err
 	}
 
 	results := make([]*plugin.DocumentScore, len(docIDs))
@@ -456,7 +456,7 @@ type dateRangeSearcher struct {
 func newDateRangeSearcher(reader plugin.IndexReader, field string, start, end *time.Time, boost float64) (*dateRangeSearcher, error) {
 	docIDs, err := reader.DateTimeRange(field, start, end)
 	if err != nil {
-		return &dateRangeSearcher{}, nil
+		return nil, err
 	}
 
 	results := make([]*plugin.DocumentScore, len(docIDs))

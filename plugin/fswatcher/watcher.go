@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,21 @@ func (w *Watcher) Scan(ctx context.Context) error {
 	batch := w.idx.NewBatch()
 	var batchErr error
 
+	// Buffer pending known-map updates; apply only after successful batch execution.
+	type pendingUpdate struct {
+		rel   string
+		state fileState
+	}
+	var pendingUpdates []pendingUpdate
+
+	// commitPending applies buffered known-map updates and resets the buffer.
+	commitPending := func() {
+		for _, pu := range pendingUpdates {
+			w.known[pu.rel] = pu.state
+		}
+		pendingUpdates = pendingUpdates[:0]
+	}
+
 	err := filepath.WalkDir(w.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip inaccessible entries
@@ -119,13 +135,29 @@ func (w *Watcher) Scan(ctx context.Context) error {
 			return nil
 		}
 
-		// Apply filter.
-		if w.cfg.filter != nil && !w.cfg.filter(rel) {
-			return nil
+		// Apply filter with panic recovery.
+		if w.cfg.filter != nil {
+			skip := func() (skip bool) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("fswatcher: panic in FilterFunc for %s: %v", rel, r)
+						skip = true
+					}
+				}()
+				return !w.cfg.filter(rel)
+			}()
+			if skip {
+				return nil
+			}
 		}
 
 		info, err := d.Info()
 		if err != nil {
+			return nil
+		}
+
+		// Skip files that exceed the maximum file size.
+		if w.cfg.maxFileSize > 0 && info.Size() > w.cfg.maxFileSize {
 			return nil
 		}
 
@@ -145,13 +177,17 @@ func (w *Watcher) Scan(ctx context.Context) error {
 
 		docID := docIDFromRel(rel)
 		batch.Index(docID, doc)
-		w.known[rel] = fileState{modTime: info.ModTime(), size: info.Size()}
+		pendingUpdates = append(pendingUpdates, pendingUpdate{
+			rel:   rel,
+			state: fileState{modTime: info.ModTime(), size: info.Size()},
+		})
 
 		if batch.Size() >= w.cfg.batchSize {
 			if err := batch.Execute(); err != nil {
 				batchErr = err
 				return err
 			}
+			commitPending()
 			batch = w.idx.NewBatch()
 		}
 		return nil
@@ -168,6 +204,7 @@ func (w *Watcher) Scan(ctx context.Context) error {
 		if err := batch.Execute(); err != nil {
 			return err
 		}
+		commitPending()
 	}
 
 	// Remove deleted files.
@@ -216,12 +253,14 @@ func (w *Watcher) buildDocument(absPath, relPath string, info os.FileInfo) (map[
 
 	text := string(content)
 
+	basename := filepath.Base(relPath)
 	doc := map[string]interface{}{
-		"path":     relPath,
-		"filename": filepath.Base(relPath),
-		"ext":      strings.TrimPrefix(filepath.Ext(relPath), "."),
-		"size":     float64(info.Size()),
-		"modified": info.ModTime().UTC().Format(time.RFC3339),
+		"path":          relPath,
+		"filename":      basename,
+		"filename_text": basename,
+		"ext":           strings.TrimPrefix(filepath.Ext(relPath), "."),
+		"size":          float64(info.Size()),
+		"modified":      info.ModTime().UTC().Format(time.RFC3339),
 	}
 
 	if w.cfg.fts {
@@ -241,10 +280,17 @@ func (w *Watcher) buildDocument(absPath, relPath string, info os.FileInfo) (map[
 	}
 
 	if w.cfg.vector && w.cfg.vectorFn != nil {
-		vec, err := w.cfg.vectorFn(text)
-		if err == nil && len(vec) > 0 {
-			doc["embedding"] = vec
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("fswatcher: panic in EmbedFunc for %s: %v", relPath, r)
+				}
+			}()
+			vec, err := w.cfg.vectorFn(text)
+			if err == nil && len(vec) > 0 {
+				doc["embedding"] = vec
+			}
+		}()
 	}
 
 	return doc, nil
@@ -264,6 +310,7 @@ func IndexMapping(opts ...Option) *mapping.IndexMapping {
 	// Always-present metadata fields.
 	dm.AddFieldMapping("path", mapping.NewKeywordFieldMapping())
 	dm.AddFieldMapping("filename", mapping.NewKeywordFieldMapping())
+	dm.AddFieldMapping("filename_text", mapping.NewTextFieldMapping())
 	dm.AddFieldMapping("ext", mapping.NewKeywordFieldMapping())
 	dm.AddFieldMapping("size", mapping.NewNumericFieldMapping())
 	dm.AddFieldMapping("modified", mapping.NewDateTimeFieldMapping())

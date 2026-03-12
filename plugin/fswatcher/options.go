@@ -26,12 +26,14 @@ type config struct {
 	pollInterval time.Duration
 	filter       FilterFunc
 	batchSize    int
+	maxFileSize  int64
 }
 
 func defaults() *config {
 	return &config{
 		pollInterval: 10 * time.Second,
 		batchSize:    64,
+		maxFileSize:  10 * 1024 * 1024, // 10 MB
 	}
 }
 
@@ -83,6 +85,17 @@ func WithBatchSize(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.batchSize = n
+		}
+	}
+}
+
+// WithMaxFileSize sets the maximum file size (in bytes) that will be indexed.
+// Files larger than this are skipped to prevent excessive memory usage.
+// Default is 10 MB.
+func WithMaxFileSize(n int64) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.maxFileSize = n
 		}
 	}
 }

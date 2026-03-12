@@ -55,7 +55,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 			return nil, err
 		}
 
-		key := prefixTerm + field.Name + "/" + term + "/" + docID
+		key := termKey(field.Name, term, docID)
 		if err := store.Set(key, string(postingJSON)); err != nil {
 			return nil, err
 		}
@@ -73,7 +73,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 			if err != nil {
 				return nil, err
 			}
-			tvKey := prefixTermVec + field.Name + "/" + docID + "/" + term
+			tvKey := termVecKey(field.Name, docID, term)
 			if err := store.Set(tvKey, string(tvJSON)); err != nil {
 				return nil, err
 			}
@@ -81,13 +81,13 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 	}
 
 	// Store field length
-	lenKey := prefixFieldLen + field.Name + "/" + docID
+	lenKey := fieldLenKey(field.Name, docID)
 	if err := store.Set(lenKey, strconv.Itoa(fieldLen)); err != nil {
 		return nil, err
 	}
 
 	// Update field length sum
-	sumKey := prefixFieldLenSum + field.Name
+	sumKey := fieldLenSumKey(field.Name)
 	currentSum, _ := helpers.GetInt64(sumKey)
 	if err := store.Set(sumKey, strconv.FormatInt(currentSum+int64(fieldLen), 10)); err != nil {
 		return nil, err
@@ -99,21 +99,21 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 func (fi *TextFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
 	store := helpers.Store()
 	for _, term := range entry.Terms {
-		if err := deleteKey(store, prefixTerm+entry.Field+"/"+term+"/"+docID); err != nil {
+		if err := deleteKey(store, termKey(entry.Field, term, docID)); err != nil {
 			return err
 		}
 		if err := helpers.DecrementDocFreq(entry.Field, term); err != nil {
 			return err
 		}
-		if err := deleteKey(store, prefixTermVec+entry.Field+"/"+docID+"/"+term); err != nil {
+		if err := deleteKey(store, termVecKey(entry.Field, docID, term)); err != nil {
 			return err
 		}
 	}
 	// Delete field length and update sum
-	lenKey := prefixFieldLen + entry.Field + "/" + docID
+	lenKey := fieldLenKey(entry.Field, docID)
 	if lenVal, err := store.Get(lenKey); err == nil {
 		fieldLen, _ := strconv.Atoi(lenVal)
-		sumKey := prefixFieldLenSum + entry.Field
+		sumKey := fieldLenSumKey(entry.Field)
 		currentSum, _ := helpers.GetInt64(sumKey)
 		newSum := currentSum - int64(fieldLen)
 		if newSum < 0 {

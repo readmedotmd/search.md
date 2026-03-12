@@ -20,7 +20,7 @@ func (fi *VectorFieldIndexer) IndexField(helpers IndexHelpers, docID string, fie
 	if err != nil {
 		return nil, err
 	}
-	key := prefixVector + field.Name + "/" + docID
+	key := vectorKey(field.Name, docID)
 	if err := helpers.Store().Set(key, string(vecJSON)); err != nil {
 		return nil, err
 	}
@@ -28,5 +28,5 @@ func (fi *VectorFieldIndexer) IndexField(helpers IndexHelpers, docID string, fie
 }
 
 func (fi *VectorFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
-	return deleteKey(helpers.Store(), prefixVector+entry.Field+"/"+docID)
+	return deleteKey(helpers.Store(), vectorKey(entry.Field, docID))
 }

@@ -167,7 +167,7 @@ func (t *CodeTokenizer) Tokenize(input []byte) []*Token {
 			}
 			// Also index operators and punctuation as tokens
 			if !unicode.IsSpace(r) {
-				size := utf8.RuneLen(r)
+				_, size := utf8.DecodeRuneInString(text[i:])
 				rawTokens = append(rawTokens, struct {
 					text  string
 					start int
