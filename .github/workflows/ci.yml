@@ -63,7 +63,7 @@ jobs:
         with:
           go-version: "1.26.1"
 
-      - uses: golangci/golangci-lint-action@4afd733a84b5f7e4a5c21ece52bae7ceb8e20ac1 # v6.5.0
+      - uses: golangci/golangci-lint-action@55c2c1448f86e01eaae002a5a3a9624417608d84 # v6.5.2
 
   vuln:
     runs-on: ubuntu-latest
