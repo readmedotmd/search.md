@@ -37,8 +37,7 @@ jobs:
             exit 0
           fi
 
-          SHORT=$(git rev-parse --short HEAD)
-          ALPHA_TAG="${LATEST}-alpha.${COUNT}.${SHORT}"
+          ALPHA_TAG="${LATEST}-alpha.${COUNT}"
 
           echo "Tagging $ALPHA_TAG"
           git tag "$ALPHA_TAG"
