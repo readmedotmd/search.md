@@ -8,7 +8,7 @@
   <text x="104" y="110" font-family="'Space Mono', 'Courier New', monospace" font-size="20" fill="#888888" font-weight="700" letter-spacing="2">FULL-TEXT SEARCH FOR GO. ONE DEPENDENCY. ZERO CONFIG.</text>
   <text x="104" y="175" font-family="'Space Mono', 'Courier New', monospace" font-size="56" fill="#FF5500" font-weight="700" letter-spacing="1">SEARCH.md</text>
   <text x="1696" y="110" font-family="'Space Mono', 'Courier New', monospace" font-size="20" fill="#888888" font-weight="700" letter-spacing="2" text-anchor="end">VERSION</text>
-  <text x="1696" y="175" font-family="'Space Mono', 'Courier New', monospace" font-size="48" fill="#FFFFFF" font-weight="700" letter-spacing="1" text-anchor="end">V0.0.0-ALPHA.7.2D1E3B8</text>
+  <text x="1696" y="175" font-family="'Space Mono', 'Courier New', monospace" font-size="48" fill="#FFFFFF" font-weight="700" letter-spacing="1" text-anchor="end">V0.0.0-ALPHA.9.0F6F676</text>
   <circle cx="486" cy="155" r="8" fill="#34C759"/>
   <text x="104" y="280" font-family="'Space Mono', 'Courier New', monospace" font-size="24" fill="#888888" letter-spacing="0.5">Full-text search for Go. One dependency. Zero config.</text>
   <rect x="104" y="424" width="140" height="44" rx="6" fill="#FF5500" stroke="#000000" stroke-width="8"/>
