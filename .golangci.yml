@@ -1,0 +1,17 @@
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - typecheck
+  disable:
+    - errcheck
+
+linters-settings:
+  staticcheck:
+    checks: ["all"]
+
+issues:
+  exclude-dirs:
+    - vendor
