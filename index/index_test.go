@@ -1,89 +1,20 @@
 package index_test
 
 import (
+	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 
-	storemd "github.com/readmedotmd/store.md"
+	"github.com/readmedotmd/store.md/backend/memory"
 
 	"github.com/readmedotmd/search.md/document"
 	"github.com/readmedotmd/search.md/index"
 )
 
-// memStore is a minimal in-memory Store implementation for testing.
-type memStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func newMemStore() *memStore {
-	return &memStore{data: make(map[string]string)}
-}
-
-func (m *memStore) Get(key string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	val, ok := m.data[key]
-	if !ok {
-		return "", storemd.NotFoundError
-	}
-	return val, nil
-}
-
-func (m *memStore) Set(key, value string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data[key] = value
-	return nil
-}
-
-func (m *memStore) Delete(key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.data[key]; !ok {
-		return storemd.NotFoundError
-	}
-	delete(m.data, key)
-	return nil
-}
-
-func (m *memStore) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var keys []string
-	for k := range m.data {
-		if args.Prefix != "" && !strings.HasPrefix(k, args.Prefix) {
-			continue
-		}
-		if args.StartAfter != "" && k <= args.StartAfter {
-			continue
-		}
-		keys = append(keys, k)
-	}
-
-	sort.Strings(keys)
-
-	limit := 0
-	if args.Limit > 0 {
-		limit = args.Limit
-	}
-
-	var result []storemd.KeyValuePair
-	for _, k := range keys {
-		if limit > 0 && len(result) >= limit {
-			break
-		}
-		result = append(result, storemd.KeyValuePair{Key: k, Value: m.data[k]})
-	}
-
-	if result == nil {
-		result = []storemd.KeyValuePair{}
-	}
-	return result, nil
+func newMemStore() *memory.StoreMemory {
+	return memory.New()
 }
 
 // recordingLogger captures log messages for verification.
@@ -129,7 +60,7 @@ func TestNew_VersionMismatch(t *testing.T) {
 	}
 
 	// Manually overwrite the version to something incompatible.
-	if err := store.Set("m/index_version", "99"); err != nil {
+	if err := store.Set(context.Background(), "m/index_version", "99"); err != nil {
 		t.Fatalf("set version: %v", err)
 	}
 
@@ -195,7 +126,7 @@ func TestSetLogger(t *testing.T) {
 		}
 
 		// Remove the reverse index entry so deletion falls back to full scan.
-		if err := store.Delete("ri/doc1"); err != nil {
+		if err := store.Delete(context.Background(), "ri/doc1"); err != nil {
 			t.Fatalf("delete reverse index: %v", err)
 		}
 
@@ -226,7 +157,7 @@ func TestGetDocCount_CorruptValue(t *testing.T) {
 	}
 
 	// Manually corrupt the doc count.
-	if err := store.Set("m/doc_count", "not_a_number"); err != nil {
+	if err := store.Set(context.Background(), "m/doc_count", "not_a_number"); err != nil {
 		t.Fatalf("set doc count: %v", err)
 	}
 
@@ -245,7 +176,7 @@ func TestTermPostings_CorruptJSON(t *testing.T) {
 
 	// Store corrupt JSON under a term posting key.
 	// Key format: t/{field}/{term}/{docID}
-	if err := store.Set("t/body/hello/doc1", "NOT VALID JSON{{{"); err != nil {
+	if err := store.Set(context.Background(), "t/body/hello/doc1", "NOT VALID JSON{{{"); err != nil {
 		t.Fatalf("set corrupt posting: %v", err)
 	}
 

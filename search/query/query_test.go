@@ -1,77 +1,18 @@
 package query
 
 import (
-	"sort"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	storemd "github.com/readmedotmd/store.md"
+	"github.com/readmedotmd/store.md/backend/memory"
 
 	"github.com/readmedotmd/search.md/document"
 	"github.com/readmedotmd/search.md/index"
 	"github.com/readmedotmd/search.md/plugin"
 )
 
-// memStore is an in-memory implementation of storemd.Store for testing.
-type memStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func newMemStore() *memStore {
-	return &memStore{data: make(map[string]string)}
-}
-
-func (m *memStore) Get(key string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.data[key]
-	if !ok {
-		return "", storemd.NotFoundError
-	}
-	return v, nil
-}
-
-func (m *memStore) Set(key, value string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data[key] = value
-	return nil
-}
-
-func (m *memStore) Delete(key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.data, key)
-	return nil
-}
-
-func (m *memStore) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var keys []string
-	for k := range m.data {
-		if args.Prefix != "" && !strings.HasPrefix(k, args.Prefix) {
-			continue
-		}
-		if args.StartAfter != "" && k <= args.StartAfter {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var result []storemd.KeyValuePair
-	for _, k := range keys {
-		result = append(result, storemd.KeyValuePair{Key: k, Value: m.data[k]})
-		if args.Limit > 0 && len(result) >= args.Limit {
-			break
-		}
-	}
-	return result, nil
+func newMemStore() *memory.StoreMemory {
+	return memory.New()
 }
 
 // defaultSF returns the default BM25 scorer factory for tests.

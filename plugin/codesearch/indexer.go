@@ -1,10 +1,13 @@
 package codesearch
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"strconv"
 	"strings"
+
+	storemd "github.com/readmedotmd/store.md"
 
 	"github.com/readmedotmd/search.md/document"
 	"github.com/readmedotmd/search.md/index"
@@ -59,6 +62,7 @@ func (fi *SymbolFieldIndexer) IndexField(helpers index.IndexHelpers, docID strin
 	}
 
 	store := helpers.Store()
+	ctx := context.Background()
 
 	// Aggregate frequencies per sub-field.
 	nameFreqs := make(map[string]int)
@@ -112,12 +116,12 @@ func (fi *SymbolFieldIndexer) IndexField(helpers index.IndexHelpers, docID strin
 	// Store field length for BM25 scoring.
 	if totalTokens > 0 {
 		lenKey := pfxFieldLen + symField + "/" + docID
-		if err := store.Set(lenKey, strconv.Itoa(totalTokens)); err != nil {
+		if err := store.Set(ctx, lenKey, strconv.Itoa(totalTokens)); err != nil {
 			return nil, err
 		}
 		sumKey := pfxFieldLenSum + symField
 		currentSum, _ := helpers.GetInt64(sumKey)
-		if err := store.Set(sumKey, strconv.FormatInt(currentSum+int64(totalTokens), 10)); err != nil {
+		if err := store.Set(ctx, sumKey, strconv.FormatInt(currentSum+int64(totalTokens), 10)); err != nil {
 			return nil, err
 		}
 	}
@@ -128,7 +132,7 @@ func (fi *SymbolFieldIndexer) IndexField(helpers index.IndexHelpers, docID strin
 		if err != nil {
 			return nil, err
 		}
-		if err := store.Set(pfxSymData+field.Name+"/"+docID, string(symJSON)); err != nil {
+		if err := store.Set(ctx, pfxSymData+field.Name+"/"+docID, string(symJSON)); err != nil {
 			return nil, err
 		}
 		allTerms = append(allTerms, "_stored")
@@ -143,6 +147,7 @@ func (fi *SymbolFieldIndexer) IndexField(helpers index.IndexHelpers, docID strin
 
 func (fi *SymbolFieldIndexer) DeleteField(helpers index.IndexHelpers, docID string, entry index.RevIdxEntry) error {
 	store := helpers.Store()
+	ctx := context.Background()
 
 	symField := entry.Field + SubSym
 	kindField := entry.Field + SubKind
@@ -150,7 +155,7 @@ func (fi *SymbolFieldIndexer) DeleteField(helpers index.IndexHelpers, docID stri
 
 	for _, term := range entry.Terms {
 		if term == "_stored" {
-			store.Delete(pfxSymData + entry.Field + "/" + docID)
+			store.Delete(ctx, pfxSymData+entry.Field+"/"+docID)
 			continue
 		}
 
@@ -171,13 +176,13 @@ func (fi *SymbolFieldIndexer) DeleteField(helpers index.IndexHelpers, docID stri
 			continue
 		}
 
-		store.Delete(pfxTerm + field + "/" + parts[1] + "/" + docID)
+		store.Delete(ctx, pfxTerm+field+"/"+parts[1]+"/"+docID)
 		helpers.DecrementDocFreq(field, parts[1])
 	}
 
 	// Update field length sum and delete field length.
 	lenKey := pfxFieldLen + symField + "/" + docID
-	if lenVal, err := store.Get(lenKey); err == nil {
+	if lenVal, err := store.Get(ctx, lenKey); err == nil {
 		fieldLen, _ := strconv.Atoi(lenVal)
 		sumKey := pfxFieldLenSum + symField
 		currentSum, _ := helpers.GetInt64(sumKey)
@@ -185,17 +190,15 @@ func (fi *SymbolFieldIndexer) DeleteField(helpers index.IndexHelpers, docID stri
 		if newSum < 0 {
 			newSum = 0
 		}
-		store.Set(sumKey, strconv.FormatInt(newSum, 10))
-		store.Delete(lenKey)
+		store.Set(ctx, sumKey, strconv.FormatInt(newSum, 10))
+		store.Delete(ctx, lenKey)
 	}
 
 	return nil
 }
 
 // indexPosting writes a single term posting to the store.
-func indexPosting(store interface {
-	Set(key, value string) error
-}, helpers index.IndexHelpers, field, term, docID string, freq, fieldLen int) error {
+func indexPosting(store storemd.Store, helpers index.IndexHelpers, field, term, docID string, freq, fieldLen int) error {
 	norm := 1.0 / math.Sqrt(float64(fieldLen))
 	posting := struct {
 		DocID     string  `json:"d"`
@@ -208,7 +211,7 @@ func indexPosting(store interface {
 		return err
 	}
 	key := pfxTerm + field + "/" + term + "/" + docID
-	if err := store.Set(key, string(data)); err != nil {
+	if err := store.Set(context.Background(), key, string(data)); err != nil {
 		return err
 	}
 	return helpers.IncrementDocFreq(field, term)
@@ -217,7 +220,7 @@ func indexPosting(store interface {
 // GetSymbols retrieves the stored symbols JSON for a document field.
 // Returns nil if no symbols were stored.
 func GetSymbols(helpers index.IndexHelpers, field, docID string) ([]Symbol, error) {
-	val, err := helpers.Store().Get(pfxSymData + field + "/" + docID)
+	val, err := helpers.Store().Get(context.Background(), pfxSymData+field+"/"+docID)
 	if err != nil {
 		return nil, err
 	}

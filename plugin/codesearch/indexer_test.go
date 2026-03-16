@@ -1,76 +1,22 @@
 package codesearch
 
 import (
-	"sort"
+	"context"
 	"strings"
-	"sync"
 	"testing"
 
 	storemd "github.com/readmedotmd/store.md"
+	"github.com/readmedotmd/store.md/backend/memory"
 
 	"github.com/readmedotmd/search.md/document"
 	"github.com/readmedotmd/search.md/index"
 )
 
-// memStore is a minimal in-memory Store for unit-testing the indexer directly.
-type memStore struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
+func newMemStore() *memory.StoreMemory { return memory.New() }
 
-func newMemStore() *memStore { return &memStore{data: make(map[string]string)} }
-
-func (m *memStore) Get(key string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	v, ok := m.data[key]
-	if !ok {
-		return "", storemd.NotFoundError
-	}
-	return v, nil
-}
-func (m *memStore) Set(key, value string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.data[key] = value
-	return nil
-}
-func (m *memStore) Delete(key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.data, key)
-	return nil
-}
-func (m *memStore) List(args storemd.ListArgs) ([]storemd.KeyValuePair, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var keys []string
-	for k := range m.data {
-		if args.Prefix != "" && !strings.HasPrefix(k, args.Prefix) {
-			continue
-		}
-		if args.StartAfter != "" && k <= args.StartAfter {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var result []storemd.KeyValuePair
-	for _, k := range keys {
-		if args.Limit > 0 && len(result) >= args.Limit {
-			break
-		}
-		result = append(result, storemd.KeyValuePair{Key: k, Value: m.data[k]})
-	}
-	if result == nil {
-		result = []storemd.KeyValuePair{}
-	}
-	return result, nil
-}
-
-// testHelpers wraps memStore to satisfy index.IndexHelpers.
+// testHelpers wraps memory.StoreMemory to satisfy index.IndexHelpers.
 type testHelpers struct {
-	store *memStore
+	store *memory.StoreMemory
 }
 
 func (h *testHelpers) Store() storemd.Store                      { return h.store }
@@ -78,7 +24,7 @@ func (h *testHelpers) IncrementDocFreq(field, term string) error { return nil }
 func (h *testHelpers) DecrementDocFreq(field, term string) error { return nil }
 func (h *testHelpers) GetDocCount() (uint64, error)              { return 1, nil }
 func (h *testHelpers) GetInt64(key string) (int64, error) {
-	v, err := h.store.Get(key)
+	v, err := h.store.Get(context.Background(), key)
 	if err != nil {
 		return 0, nil
 	}
@@ -118,7 +64,7 @@ func TestSymbolFieldIndexer_IndexAndDelete(t *testing.T) {
 	}
 
 	// Verify postings were written.
-	val, err := ms.Get("t/code.sym/hello/doc1")
+	val, err := ms.Get(context.Background(), "t/code.sym/hello/doc1")
 	if err != nil {
 		t.Error("expected posting for hello symbol")
 	}
@@ -127,23 +73,23 @@ func TestSymbolFieldIndexer_IndexAndDelete(t *testing.T) {
 	}
 
 	// Verify kind posting.
-	_, err = ms.Get("t/code.kind/function/doc1")
+	_, err = ms.Get(context.Background(), "t/code.kind/function/doc1")
 	if err != nil {
 		t.Error("expected posting for function kind")
 	}
-	_, err = ms.Get("t/code.kind/struct/doc1")
+	_, err = ms.Get(context.Background(), "t/code.kind/struct/doc1")
 	if err != nil {
 		t.Error("expected posting for struct kind")
 	}
 
 	// Verify stored symbols.
-	_, err = ms.Get("sym/code/doc1")
+	_, err = ms.Get(context.Background(), "sym/code/doc1")
 	if err != nil {
 		t.Error("expected stored symbols JSON")
 	}
 
 	// Verify field length.
-	_, err = ms.Get("f/code.sym/doc1")
+	_, err = ms.Get(context.Background(), "f/code.sym/doc1")
 	if err != nil {
 		t.Error("expected field length entry")
 	}
@@ -155,19 +101,19 @@ func TestSymbolFieldIndexer_IndexAndDelete(t *testing.T) {
 	}
 
 	// Verify postings removed.
-	_, err = ms.Get("t/code.sym/hello/doc1")
+	_, err = ms.Get(context.Background(), "t/code.sym/hello/doc1")
 	if err == nil {
 		t.Error("expected posting to be deleted")
 	}
-	_, err = ms.Get("t/code.kind/function/doc1")
+	_, err = ms.Get(context.Background(), "t/code.kind/function/doc1")
 	if err == nil {
 		t.Error("expected kind posting to be deleted")
 	}
-	_, err = ms.Get("sym/code/doc1")
+	_, err = ms.Get(context.Background(), "sym/code/doc1")
 	if err == nil {
 		t.Error("expected stored symbols to be deleted")
 	}
-	_, err = ms.Get("f/code.sym/doc1")
+	_, err = ms.Get(context.Background(), "f/code.sym/doc1")
 	if err == nil {
 		t.Error("expected field length to be deleted")
 	}
@@ -242,13 +188,13 @@ func TestSymbolFieldIndexer_StoreDisabled(t *testing.T) {
 	}
 
 	// Postings should exist.
-	_, err = ms.Get("t/code.sym/foo/doc1")
+	_, err = ms.Get(context.Background(), "t/code.sym/foo/doc1")
 	if err != nil {
 		t.Error("expected posting for foo symbol")
 	}
 
 	// Stored symbols should NOT exist.
-	_, err = ms.Get("sym/code/doc1")
+	_, err = ms.Get(context.Background(), "sym/code/doc1")
 	if err == nil {
 		t.Error("expected no stored symbols when Store=false")
 	}
@@ -284,7 +230,7 @@ func TestSymbolFieldIndexer_ScopeIndexed(t *testing.T) {
 	}
 
 	// Verify scope posting.
-	_, err = ms.Get("t/code.scope/server/doc1")
+	_, err = ms.Get(context.Background(), "t/code.scope/server/doc1")
 	if err != nil {
 		t.Error("expected scope posting for 'server'")
 	}

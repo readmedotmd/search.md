@@ -99,3 +99,7 @@ func (a *IndexAdapter) FuzzyTerms(field, term string, maxDist int) ([]string, er
 func (a *IndexAdapter) HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool) {
 	return a.Idx.HNSWSearch(field, query, k)
 }
+
+func (a *IndexAdapter) BatchFieldLengths(field string, docIDs []string) {
+	a.Idx.BatchFieldLengths(field, docIDs)
+}

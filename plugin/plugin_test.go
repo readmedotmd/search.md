@@ -156,6 +156,7 @@ func (m *mockIndexReader) FuzzyTerms(field, term string, maxDist int) ([]string,
 func (m *mockIndexReader) HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool) {
 	return nil, nil, false
 }
+func (m *mockIndexReader) BatchFieldLengths(field string, docIDs []string) {}
 
 // ===========================================================================
 // HTML Highlighter Tests

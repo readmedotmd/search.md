@@ -30,6 +30,7 @@ import (
 	"time"
 
 	storemd "github.com/readmedotmd/store.md"
+	"github.com/readmedotmd/store.md/sync/cache"
 
 	"github.com/readmedotmd/search.md/document"
 	"github.com/readmedotmd/search.md/index"
@@ -81,7 +82,10 @@ func New(store storemd.Store, indexMapping *mapping.IndexMapping, opts ...plugin
 		return nil, fmt.Errorf("invalid mapping: %w", err)
 	}
 
-	idx, err := index.New(store)
+	// Wrap store with in-memory cache to reduce repeated reads.
+	cached := cache.New(store)
+
+	idx, err := index.New(cached)
 	if err != nil {
 		return nil, fmt.Errorf("open index: %w", err)
 	}
@@ -101,7 +105,7 @@ func New(store storemd.Store, indexMapping *mapping.IndexMapping, opts ...plugin
 	}
 
 	return &SearchIndex{
-		store:   store,
+		store:   cached,
 		idx:     idx,
 		reader:  &plugin.IndexAdapter{Idx: idx},
 		mapping: indexMapping,
@@ -334,11 +338,16 @@ func (si *SearchIndex) SearchWithRequest(ctx context.Context, req *search.Search
 	hasFacets := len(req.Facets) > 0
 	var facetDocIDs []string
 
+	// Check context cancellation periodically, not every iteration.
+	// The select with channel read is expensive in tight loops.
+	ctxDone := ctx.Done()
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if totalHits&63 == 0 && ctxDone != nil {
+			select {
+			case <-ctxDone:
+				return nil, ctx.Err()
+			default:
+			}
 		}
 
 		ds, err := searcher.Next()

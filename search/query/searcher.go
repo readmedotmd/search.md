@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/readmedotmd/search.md/index"
 	"github.com/readmedotmd/search.md/plugin"
 )
 
@@ -42,22 +43,34 @@ func newTermSearcher(reader plugin.IndexReader, field, term string, boost float6
 
 	s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 
-	results := make([]*plugin.DocumentScore, 0, len(postings))
-	for _, p := range postings {
+	// Batch-preload field lengths to avoid N individual KV lookups.
+	docIDs := make([]string, len(postings))
+	for i, p := range postings {
+		docIDs[i] = p.DocID
+	}
+	reader.BatchFieldLengths(field, docIDs)
+
+	// Pre-allocate as values, not pointers, to reduce allocations.
+	scored := make([]plugin.DocumentScore, len(postings))
+	for i, p := range postings {
 		fieldLen, _ := reader.FieldLength(field, p.DocID)
 		if fieldLen == 0 {
 			fieldLen = 1
 		}
-		score := s.Score(p.Frequency, fieldLen, boost)
-		results = append(results, &plugin.DocumentScore{
+		scored[i] = plugin.DocumentScore{
 			ID:    p.DocID,
-			Score: score,
-		})
+			Score: s.Score(p.Frequency, fieldLen, boost),
+		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
 	})
+
+	results := make([]*plugin.DocumentScore, len(scored))
+	for i := range scored {
+		results[i] = &scored[i]
+	}
 
 	return &termSearcher{results: results}, nil
 }
@@ -96,26 +109,35 @@ func newPhraseSearcher(reader plugin.IndexReader, field string, terms []string, 
 	avgFieldLen, _ := reader.AverageFieldLength(field)
 	s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 
-	var results []*plugin.DocumentScore
+	// Batch-preload field lengths for all candidate documents.
+	candidateDocIDs := make([]string, len(firstPostings))
+	for i, fp := range firstPostings {
+		candidateDocIDs[i] = fp.DocID
+	}
+	reader.BatchFieldLengths(field, candidateDocIDs)
+
+	var scored []plugin.DocumentScore
 
 	for _, fp := range firstPostings {
 		docID := fp.DocID
 
 		if containsPhrase(reader, field, docID, terms) {
 			fieldLen, _ := reader.FieldLength(field, docID)
-
-			score := s.Score(fp.Frequency, fieldLen, boost)
-
-			results = append(results, &plugin.DocumentScore{
+			scored = append(scored, plugin.DocumentScore{
 				ID:    docID,
-				Score: score,
+				Score: s.Score(fp.Frequency, fieldLen, boost),
 			})
 		}
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
 	})
+
+	results := make([]*plugin.DocumentScore, len(scored))
+	for i := range scored {
+		results[i] = &scored[i]
+	}
 
 	return &phraseSearcher{results: results}, nil
 }
@@ -183,33 +205,7 @@ func newPrefixSearcher(reader plugin.IndexReader, field, prefix string, boost fl
 		terms = terms[:maxMatchingTerms]
 	}
 
-	docCount, _ := reader.DocCount()
-	avgFieldLen, _ := reader.AverageFieldLength(field)
-
-	docScores := make(map[string]float64)
-	for _, term := range terms {
-		postings, _ := reader.TermPostings(field, term)
-		docFreq, _ := reader.DocumentFrequency(field, term)
-		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
-
-		for _, p := range postings {
-			fieldLen, _ := reader.FieldLength(field, p.DocID)
-			if fieldLen == 0 {
-				fieldLen = 1
-			}
-			score := s.Score(p.Frequency, fieldLen, boost)
-			docScores[p.DocID] += score
-		}
-	}
-
-	results := make([]*plugin.DocumentScore, 0, len(docScores))
-	for docID, score := range docScores {
-		results = append(results, &plugin.DocumentScore{ID: docID, Score: score})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
+	results := scoreMultiTerms(reader, field, terms, boost, sf)
 	return &prefixSearcher{results: results}, nil
 }
 
@@ -256,33 +252,7 @@ func newFuzzySearcher(reader plugin.IndexReader, field, term string, fuzziness i
 		return &fuzzySearcher{}, nil
 	}
 
-	docCount, _ := reader.DocCount()
-	avgFieldLen, _ := reader.AverageFieldLength(field)
-
-	docScores := make(map[string]float64)
-	for _, mt := range matchingTerms {
-		postings, _ := reader.TermPostings(field, mt)
-		docFreq, _ := reader.DocumentFrequency(field, mt)
-		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
-
-		for _, p := range postings {
-			fieldLen, _ := reader.FieldLength(field, p.DocID)
-			if fieldLen == 0 {
-				fieldLen = 1
-			}
-			score := s.Score(p.Frequency, fieldLen, boost)
-			docScores[p.DocID] += score
-		}
-	}
-
-	results := make([]*plugin.DocumentScore, 0, len(docScores))
-	for docID, score := range docScores {
-		results = append(results, &plugin.DocumentScore{ID: docID, Score: score})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
+	results := scoreMultiTerms(reader, field, matchingTerms, boost, sf)
 	return &fuzzySearcher{results: results}, nil
 }
 
@@ -335,6 +305,57 @@ func levenshteinDistance(a, b string) int {
 	return prev[lb]
 }
 
+// scoreMultiTerms is a shared helper for prefix, fuzzy, and regexp searchers.
+// It scores documents across multiple matching terms efficiently by fetching
+// docCount and avgFieldLen once, and using bulk-cached field lengths.
+func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, boost float64, sf plugin.ScorerFactory) []*plugin.DocumentScore {
+	docCount, _ := reader.DocCount()
+	avgFieldLen, _ := reader.AverageFieldLength(field)
+
+	// Collect all postings first, then batch-preload field lengths.
+	type termPostingPair struct {
+		postings []index.Posting
+		scorer   plugin.Scorer
+	}
+	pairs := make([]termPostingPair, 0, len(terms))
+	var allDocIDs []string
+	for _, term := range terms {
+		postings, _ := reader.TermPostings(field, term)
+		docFreq, _ := reader.DocumentFrequency(field, term)
+		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
+		pairs = append(pairs, termPostingPair{postings: postings, scorer: s})
+		for _, p := range postings {
+			allDocIDs = append(allDocIDs, p.DocID)
+		}
+	}
+	reader.BatchFieldLengths(field, allDocIDs)
+
+	docScores := make(map[string]float64, len(allDocIDs))
+	for _, pair := range pairs {
+		for _, p := range pair.postings {
+			fieldLen, _ := reader.FieldLength(field, p.DocID)
+			if fieldLen == 0 {
+				fieldLen = 1
+			}
+			docScores[p.DocID] += pair.scorer.Score(p.Frequency, fieldLen, boost)
+		}
+	}
+
+	scored := make([]plugin.DocumentScore, 0, len(docScores))
+	for docID, score := range docScores {
+		scored = append(scored, plugin.DocumentScore{ID: docID, Score: score})
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
+	})
+
+	results := make([]*plugin.DocumentScore, len(scored))
+	for i := range scored {
+		results[i] = &scored[i]
+	}
+	return results
+}
+
 // regexpSearcher searches for terms matching a regular expression.
 type regexpSearcher struct {
 	results []*plugin.DocumentScore
@@ -366,33 +387,7 @@ func newRegexpSearcher(reader plugin.IndexReader, field, pattern string, boost f
 		return &regexpSearcher{}, nil
 	}
 
-	docCount, _ := reader.DocCount()
-	avgFieldLen, _ := reader.AverageFieldLength(field)
-
-	docScores := make(map[string]float64)
-	for _, mt := range matchingTerms {
-		postings, _ := reader.TermPostings(field, mt)
-		docFreq, _ := reader.DocumentFrequency(field, mt)
-		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
-
-		for _, p := range postings {
-			fieldLen, _ := reader.FieldLength(field, p.DocID)
-			if fieldLen == 0 {
-				fieldLen = 1
-			}
-			score := s.Score(p.Frequency, fieldLen, boost)
-			docScores[p.DocID] += score
-		}
-	}
-
-	results := make([]*plugin.DocumentScore, 0, len(docScores))
-	for docID, score := range docScores {
-		results = append(results, &plugin.DocumentScore{ID: docID, Score: score})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
-
+	results := scoreMultiTerms(reader, field, matchingTerms, boost, sf)
 	return &regexpSearcher{results: results}, nil
 }
 
@@ -486,51 +481,62 @@ func newConjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		return &conjunctionSearcher{}, nil
 	}
 
-	firstSearcher, err := queries[0].Searcher(reader, field, sf)
-	if err != nil {
-		return nil, err
+	// Execute all sub-queries and sort by result count (smallest first)
+	// to minimize intersection work.
+	type searcherResult struct {
+		scores map[string]float64
+		count  int
 	}
 
-	candidates := make(map[string]float64)
-	for {
-		ds, err := firstSearcher.Next()
-		if err != nil || ds == nil {
-			break
-		}
-		candidates[ds.ID] = ds.Score
-	}
-
-	for i := 1; i < len(queries) && len(candidates) > 0; i++ {
-		s, err := queries[i].Searcher(reader, field, sf)
+	searchers := make([]searcherResult, len(queries))
+	for i, q := range queries {
+		s, err := q.Searcher(reader, field, sf)
 		if err != nil {
 			return nil, err
 		}
-		otherScores := make(map[string]float64)
+		scores := make(map[string]float64)
 		for {
 			ds, err := s.Next()
 			if err != nil || ds == nil {
 				break
 			}
-			if _, ok := candidates[ds.ID]; ok {
-				otherScores[ds.ID] = ds.Score
-			}
+			scores[ds.ID] = ds.Score
 		}
-		for docID := range candidates {
-			if otherScore, ok := otherScores[docID]; ok {
-				candidates[docID] += otherScore
-			} else {
-				delete(candidates, docID)
-			}
-		}
+		searchers[i] = searcherResult{scores: scores, count: len(scores)}
 	}
 
-	results := make([]*plugin.DocumentScore, 0, len(candidates))
-	for docID, score := range candidates {
-		results = append(results, &plugin.DocumentScore{ID: docID, Score: score * boost})
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
+	// Sort by count ascending so we start with the smallest set.
+	sort.Slice(searchers, func(i, j int) bool {
+		return searchers[i].count < searchers[j].count
 	})
+
+	// Start with the smallest result set as candidates.
+	candidates := searchers[0].scores
+
+	// Intersect with remaining sets.
+	for i := 1; i < len(searchers) && len(candidates) > 0; i++ {
+		other := searchers[i].scores
+		newCandidates := make(map[string]float64, len(candidates))
+		for docID, score := range candidates {
+			if otherScore, ok := other[docID]; ok {
+				newCandidates[docID] = score + otherScore
+			}
+		}
+		candidates = newCandidates
+	}
+
+	scored := make([]plugin.DocumentScore, 0, len(candidates))
+	for docID, score := range candidates {
+		scored = append(scored, plugin.DocumentScore{ID: docID, Score: score * boost})
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
+	})
+
+	results := make([]*plugin.DocumentScore, len(scored))
+	for i := range scored {
+		results[i] = &scored[i]
+	}
 
 	return &conjunctionSearcher{results: results}, nil
 }

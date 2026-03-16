@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/readmedotmd/search.md/document"
@@ -17,6 +18,7 @@ func (fi *BooleanFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 		return nil, nil
 	}
 	store := helpers.Store()
+	ctx := context.Background()
 	termVal := "F"
 	if val {
 		termVal = "T"
@@ -24,14 +26,14 @@ func (fi *BooleanFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 	posting := Posting{DocID: docID, Frequency: 1, Norm: 1.0}
 	postingJSON, _ := json.Marshal(posting)
 	key := termKey(field.Name, termVal, docID)
-	if err := store.Set(key, string(postingJSON)); err != nil {
+	if err := store.Set(ctx, key, string(postingJSON)); err != nil {
 		return nil, err
 	}
 	if err := helpers.IncrementDocFreq(field.Name, termVal); err != nil {
 		return nil, err
 	}
 	bk := boolKey(field.Name, docID)
-	if err := store.Set(bk, termVal); err != nil {
+	if err := store.Set(ctx, bk, termVal); err != nil {
 		return nil, err
 	}
 	return &RevIdxEntry{Field: field.Name, Type: "bool", Terms: []string{termVal}}, nil

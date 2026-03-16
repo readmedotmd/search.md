@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"errors"
 
 	storemd "github.com/readmedotmd/store.md"
@@ -11,7 +12,7 @@ import (
 // deleteKey deletes a key from the store, treating NotFoundError as success
 // since the goal of deletion is to ensure the key no longer exists.
 func deleteKey(store storemd.Store, key string) error {
-	err := store.Delete(key)
+	err := store.Delete(context.Background(), key)
 	if err != nil && errors.Is(err, storemd.NotFoundError) {
 		return nil
 	}

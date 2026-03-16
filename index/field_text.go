@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -36,6 +37,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 	}
 
 	store := helpers.Store()
+	ctx := context.Background()
 	tfs := analysis.TokenFrequencies(tokens, field.IncludeTermVectors)
 	fieldLen := len(tokens)
 	norm := 1.0 / math.Sqrt(float64(fieldLen))
@@ -56,7 +58,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 		}
 
 		key := termKey(field.Name, term, docID)
-		if err := store.Set(key, string(postingJSON)); err != nil {
+		if err := store.Set(ctx, key, string(postingJSON)); err != nil {
 			return nil, err
 		}
 
@@ -74,7 +76,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 				return nil, err
 			}
 			tvKey := termVecKey(field.Name, docID, term)
-			if err := store.Set(tvKey, string(tvJSON)); err != nil {
+			if err := store.Set(ctx, tvKey, string(tvJSON)); err != nil {
 				return nil, err
 			}
 		}
@@ -82,14 +84,14 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 
 	// Store field length
 	lenKey := fieldLenKey(field.Name, docID)
-	if err := store.Set(lenKey, strconv.Itoa(fieldLen)); err != nil {
+	if err := store.Set(ctx, lenKey, strconv.Itoa(fieldLen)); err != nil {
 		return nil, err
 	}
 
 	// Update field length sum
 	sumKey := fieldLenSumKey(field.Name)
 	currentSum, _ := helpers.GetInt64(sumKey)
-	if err := store.Set(sumKey, strconv.FormatInt(currentSum+int64(fieldLen), 10)); err != nil {
+	if err := store.Set(ctx, sumKey, strconv.FormatInt(currentSum+int64(fieldLen), 10)); err != nil {
 		return nil, err
 	}
 
@@ -98,6 +100,7 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 
 func (fi *TextFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
 	store := helpers.Store()
+	ctx := context.Background()
 	for _, term := range entry.Terms {
 		if err := deleteKey(store, termKey(entry.Field, term, docID)); err != nil {
 			return err
@@ -111,7 +114,7 @@ func (fi *TextFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entr
 	}
 	// Delete field length and update sum
 	lenKey := fieldLenKey(entry.Field, docID)
-	if lenVal, err := store.Get(lenKey); err == nil {
+	if lenVal, err := store.Get(ctx, lenKey); err == nil {
 		fieldLen, _ := strconv.Atoi(lenVal)
 		sumKey := fieldLenSumKey(entry.Field)
 		currentSum, _ := helpers.GetInt64(sumKey)
@@ -119,7 +122,7 @@ func (fi *TextFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entr
 		if newSum < 0 {
 			newSum = 0
 		}
-		if err := store.Set(sumKey, strconv.FormatInt(newSum, 10)); err != nil {
+		if err := store.Set(ctx, sumKey, strconv.FormatInt(newSum, 10)); err != nil {
 			return err
 		}
 		if err := deleteKey(store, lenKey); err != nil {

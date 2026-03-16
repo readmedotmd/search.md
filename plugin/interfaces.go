@@ -47,6 +47,9 @@ type IndexReader interface {
 	// Optimized search methods
 	FuzzyTerms(field, term string, maxDist int) ([]string, error)
 	HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool)
+
+	// Batch operations for performance
+	BatchFieldLengths(field string, docIDs []string)
 }
 
 // Scorer computes relevance scores for matched documents.

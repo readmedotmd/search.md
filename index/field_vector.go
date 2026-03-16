@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/readmedotmd/search.md/document"
@@ -21,7 +22,7 @@ func (fi *VectorFieldIndexer) IndexField(helpers IndexHelpers, docID string, fie
 		return nil, err
 	}
 	key := vectorKey(field.Name, docID)
-	if err := helpers.Store().Set(key, string(vecJSON)); err != nil {
+	if err := helpers.Store().Set(context.Background(), key, string(vecJSON)); err != nil {
 		return nil, err
 	}
 	return &RevIdxEntry{Field: field.Name, Type: "vector"}, nil

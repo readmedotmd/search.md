@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -123,9 +124,9 @@ func New(store storemd.Store) (*Index, error) {
 	idx.RegisterFieldIndexer(&VectorFieldIndexer{})
 
 	// Initialize index version if not already set, or check for mismatch.
-	storedVersion, err := store.Get(keyIndexVersion)
+	storedVersion, err := store.Get(context.Background(), keyIndexVersion)
 	if err != nil {
-		if err := store.Set(keyIndexVersion, currentIndexVersion); err != nil {
+		if err := store.Set(context.Background(), keyIndexVersion, currentIndexVersion); err != nil {
 			return nil, fmt.Errorf("set index version: %w", err)
 		}
 	} else if storedVersion != currentIndexVersion {
@@ -137,7 +138,7 @@ func New(store storemd.Store) (*Index, error) {
 
 // IndexVersion returns the stored index format version.
 func (idx *Index) IndexVersion() string {
-	val, err := idx.store.Get(keyIndexVersion)
+	val, err := idx.store.Get(context.Background(),keyIndexVersion)
 	if err != nil {
 		return ""
 	}
@@ -187,7 +188,7 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 	if err != nil {
 		return fmt.Errorf("marshal document: %w", err)
 	}
-	if err := idx.store.Set(docKey(doc.ID), string(docJSON)); err != nil {
+	if err := idx.store.Set(context.Background(),docKey(doc.ID), string(docJSON)); err != nil {
 		return fmt.Errorf("store document: %w", err)
 	}
 
@@ -223,7 +224,7 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 		if err != nil {
 			return fmt.Errorf("marshal reverse index: %w", err)
 		}
-		if err := idx.store.Set(revIdxKey(doc.ID), string(riJSON)); err != nil {
+		if err := idx.store.Set(context.Background(),revIdxKey(doc.ID), string(riJSON)); err != nil {
 			return fmt.Errorf("store reverse index: %w", err)
 		}
 	}
@@ -234,7 +235,7 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 		if err != nil {
 			return fmt.Errorf("get doc count: %w", err)
 		}
-		if err := idx.store.Set(keyDocCount, strconv.FormatUint(count+1, 10)); err != nil {
+		if err := idx.store.Set(context.Background(),keyDocCount, strconv.FormatUint(count+1, 10)); err != nil {
 			return fmt.Errorf("update doc count: %w", err)
 		}
 	}
@@ -290,7 +291,7 @@ func (idx *Index) DeleteDocument(docID string) error {
 			return fmt.Errorf("get doc count: %w", err)
 		}
 		if count > 0 {
-			if err := idx.store.Set(keyDocCount, strconv.FormatUint(count-1, 10)); err != nil {
+			if err := idx.store.Set(context.Background(),keyDocCount, strconv.FormatUint(count-1, 10)); err != nil {
 				return fmt.Errorf("update doc count: %w", err)
 			}
 		}
@@ -300,7 +301,7 @@ func (idx *Index) DeleteDocument(docID string) error {
 
 func (idx *Index) deleteDocInternal(docID string) (bool, error) {
 	// Check if document exists
-	_, err := idx.store.Get(docKey(docID))
+	_, err := idx.store.Get(context.Background(),docKey(docID))
 	if err != nil {
 		return false, nil
 	}
@@ -311,7 +312,7 @@ func (idx *Index) deleteDocInternal(docID string) (bool, error) {
 	}
 
 	// Try targeted deletion using the reverse index
-	riVal, riErr := idx.store.Get(revIdxKey(docID))
+	riVal, riErr := idx.store.Get(context.Background(),revIdxKey(docID))
 	if riErr == nil {
 		var entries []RevIdxEntry
 		if json.Unmarshal([]byte(riVal), &entries) == nil {
@@ -373,7 +374,7 @@ func (idx *Index) deleteDocWithRevIdx(docID string, entries []RevIdxEntry) error
 func (idx *Index) forEachWithPrefix(prefix string, fn func(key, value string) error) error {
 	startAfter := ""
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -430,7 +431,7 @@ func (idx *Index) deleteDocFullScan(docID string) error {
 				if newSum < 0 {
 					newSum = 0
 				}
-				if err := idx.store.Set(sumKey, strconv.FormatInt(newSum, 10)); err != nil {
+				if err := idx.store.Set(context.Background(),sumKey, strconv.FormatInt(newSum, 10)); err != nil {
 					return fmt.Errorf("update field length sum: %w", err)
 				}
 			}
@@ -542,7 +543,7 @@ func (idx *Index) GetDocument(docID string) (*document.StoredData, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	val, err := idx.store.Get(docKey(docID))
+	val, err := idx.store.Get(context.Background(),docKey(docID))
 	if err != nil {
 		return nil, fmt.Errorf("document not found: %s", docID)
 	}
@@ -565,7 +566,7 @@ func (idx *Index) DocCount() (uint64, error) {
 }
 
 func (idx *Index) getDocCount() (uint64, error) {
-	val, err := idx.store.Get(keyDocCount)
+	val, err := idx.store.Get(context.Background(),keyDocCount)
 	if err != nil {
 		return 0, nil
 	}
@@ -640,7 +641,7 @@ func (idx *Index) DocumentFrequency(field, term string) (uint64, error) {
 
 func (idx *Index) docFreq(field, term string) (uint64, error) {
 	key := docFreqKey(field, term)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(),key)
 	if err != nil {
 		return 0, nil
 	}
@@ -654,7 +655,7 @@ func (idx *Index) docFreq(field, term string) (uint64, error) {
 func (idx *Index) incrementDocFreq(field, term string) error {
 	key := docFreqKey(field, term)
 	count, _ := idx.docFreq(field, term) // error intentionally ignored; 0 is acceptable fallback
-	return idx.store.Set(key, strconv.FormatUint(count+1, 10))
+	return idx.store.Set(context.Background(),key, strconv.FormatUint(count+1, 10))
 }
 
 func (idx *Index) decrementDocFreq(field, term string) error {
@@ -663,7 +664,7 @@ func (idx *Index) decrementDocFreq(field, term string) error {
 	if count <= 1 {
 		return deleteKey(idx.store, key)
 	}
-	return idx.store.Set(key, strconv.FormatUint(count-1, 10))
+	return idx.store.Set(context.Background(),key, strconv.FormatUint(count-1, 10))
 }
 
 // FieldLength returns the length (token count) of a field in a document.
@@ -672,7 +673,7 @@ func (idx *Index) FieldLength(field, docID string) (int, error) {
 		return v, nil
 	}
 	key := fieldLenKey(field, docID)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(), key)
 	if err != nil {
 		idx.cache.SetFieldLen(field, docID, 0)
 		return 0, nil
@@ -683,6 +684,41 @@ func (idx *Index) FieldLength(field, docID string) (int, error) {
 	}
 	idx.cache.SetFieldLen(field, docID, n)
 	return n, nil
+}
+
+// BatchFieldLengths pre-fetches field lengths for a batch of docIDs into the cache.
+// Subsequent FieldLength calls for these documents will be cache hits.
+func (idx *Index) BatchFieldLengths(field string, docIDs []string) {
+	// First pass: find which docIDs need fetching (under read lock).
+	var missing []string
+	for _, docID := range docIDs {
+		if _, ok := idx.cache.GetFieldLen(field, docID); !ok {
+			missing = append(missing, docID)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	// Second pass: fetch from store.
+	lengths := make(map[string]int, len(missing))
+	for _, docID := range missing {
+		key := fieldLenKey(field, docID)
+		val, err := idx.store.Get(context.Background(), key)
+		if err != nil {
+			lengths[docID] = 0
+			continue
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			lengths[docID] = 0
+			continue
+		}
+		lengths[docID] = n
+	}
+
+	// Third pass: batch write to cache (single lock acquisition).
+	idx.cache.BatchSetFieldLen(field, lengths)
 }
 
 // AverageFieldLength returns the average field length across all documents.
@@ -717,7 +753,7 @@ func (idx *Index) avgFieldLength(field string) (float64, error) {
 }
 
 func (idx *Index) getInt64(key string) (int64, error) {
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(),key)
 	if err != nil {
 		return 0, nil
 	}
@@ -730,11 +766,14 @@ func (idx *Index) getInt64(key string) (int64, error) {
 
 // GetTermVector retrieves term vectors for a specific field/doc/term.
 func (idx *Index) GetTermVector(field, docID, term string) (*TermVector, error) {
+	if tv, ok := idx.cache.GetTermVec(field, docID, term); ok {
+		return tv, nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
 	key := termVecKey(field, docID, term)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(), key)
 	if err != nil {
 		return nil, err
 	}
@@ -742,6 +781,7 @@ func (idx *Index) GetTermVector(field, docID, term string) (*TermVector, error) 
 	if err := json.Unmarshal([]byte(val), &tv); err != nil {
 		return nil, err
 	}
+	idx.cache.SetTermVec(field, docID, term, &tv)
 	return &tv, nil
 }
 
@@ -751,7 +791,7 @@ func (idx *Index) GetVector(field, docID string) ([]float32, error) {
 	defer idx.mu.RUnlock()
 
 	key := vectorKey(field, docID)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(),key)
 	if err != nil {
 		return nil, err
 	}
@@ -768,7 +808,7 @@ func (idx *Index) AllVectors(field string) (map[string][]float32, error) {
 	defer idx.mu.RUnlock()
 
 	prefix := vectorFieldPrefix(field)
-	results, err := idx.store.List(storemd.ListArgs{Prefix: prefix})
+	results, err := idx.store.List(context.Background(),storemd.ListArgs{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}
@@ -796,7 +836,7 @@ func (idx *Index) ForEachVector(field string, fn func(docID string, vec []float3
 	startAfter := ""
 
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      batchSize,
@@ -837,7 +877,7 @@ func (idx *Index) ForEachDocID(fn func(docID string) bool) error {
 	startAfter := ""
 
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefixDoc,
 			StartAfter: startAfter,
 			Limit:      batchSize,
@@ -936,7 +976,7 @@ func (idx *Index) numericRangeSorted(field string, min, max *float64) ([]string,
 
 	var docIDs []string
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -969,7 +1009,7 @@ func (idx *Index) numericRangeLegacy(field string, min, max *float64) ([]string,
 	var docIDs []string
 	startAfter := ""
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -1034,7 +1074,7 @@ func (idx *Index) dateTimeRangeSorted(field string, start, end *time.Time) ([]st
 
 	var docIDs []string
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -1067,7 +1107,7 @@ func (idx *Index) dateTimeRangeLegacy(field string, start, end *time.Time) ([]st
 	var docIDs []string
 	startAfter := ""
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(),storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -1106,7 +1146,7 @@ func (idx *Index) AllDocIDs() ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	results, err := idx.store.List(storemd.ListArgs{Prefix: prefixDoc})
+	results, err := idx.store.List(context.Background(),storemd.ListArgs{Prefix: prefixDoc})
 	if err != nil {
 		return nil, err
 	}
@@ -1130,7 +1170,7 @@ func (idx *Index) ListDocIDs(startAfter string, limit int) ([]string, error) {
 		storeStartAfter = docKey(startAfter)
 	}
 
-	results, err := idx.store.List(storemd.ListArgs{
+	results, err := idx.store.List(context.Background(),storemd.ListArgs{
 		Prefix:     prefixDoc,
 		StartAfter: storeStartAfter,
 		Limit:      limit,
@@ -1150,7 +1190,7 @@ func (idx *Index) ListDocIDs(startAfter string, limit int) ([]string, error) {
 // GetNumericValue returns the numeric value for a field in a document.
 func (idx *Index) GetNumericValue(field, docID string) (float64, bool) {
 	key := numericKey(field, docID)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(),key)
 	if err != nil {
 		return 0, false
 	}
@@ -1164,7 +1204,7 @@ func (idx *Index) GetNumericValue(field, docID string) (float64, bool) {
 // GetDateTimeValue returns the datetime value for a field in a document.
 func (idx *Index) GetDateTimeValue(field, docID string) (time.Time, bool) {
 	key := dateTimeKey(field, docID)
-	val, err := idx.store.Get(key)
+	val, err := idx.store.Get(context.Background(),key)
 	if err != nil {
 		return time.Time{}, false
 	}

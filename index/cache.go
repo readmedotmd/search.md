@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strconv"
@@ -29,6 +30,8 @@ type Cache struct {
 	// fieldLens caches field lengths per field per document.
 	// Key: field name, Value: map[docID]fieldLen.
 	fieldLens map[string]map[string]int
+	// fieldLensLoaded tracks which fields have had all lengths bulk-loaded.
+	fieldLensLoaded map[string]bool
 
 	// docFreqs caches document frequencies per field+term.
 	// Key: "field\x00term", Value: docFreq.
@@ -39,19 +42,24 @@ type Cache struct {
 
 	// docCount caches the total document count. -1 means not cached.
 	docCount int64
+
+	// termVecs caches term vectors per field+docID+term.
+	termVecs map[string]*TermVector
 }
 
 const defaultMaxPostings = 1024
 
 func newCache() *Cache {
 	return &Cache{
-		termDict:    make(map[string][]string),
-		postings:    make(map[string][]Posting),
-		maxPostings: defaultMaxPostings,
-		fieldLens:   make(map[string]map[string]int),
-		docFreqs:    make(map[string]uint64),
-		avgFieldLen: make(map[string]float64),
-		docCount:    -1,
+		termDict:        make(map[string][]string),
+		postings:        make(map[string][]Posting),
+		maxPostings:     defaultMaxPostings,
+		fieldLens:       make(map[string]map[string]int),
+		fieldLensLoaded: make(map[string]bool),
+		docFreqs:        make(map[string]uint64),
+		avgFieldLen:     make(map[string]float64),
+		docCount:        -1,
+		termVecs:        make(map[string]*TermVector),
 	}
 }
 
@@ -121,6 +129,52 @@ func (c *Cache) SetFieldLen(field, docID string, length int) {
 	m[docID] = length
 }
 
+// BatchSetFieldLen sets multiple field lengths under a single lock acquisition.
+func (c *Cache) BatchSetFieldLen(field string, lengths map[string]int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m, ok := c.fieldLens[field]
+	if !ok {
+		m = make(map[string]int, len(lengths))
+		c.fieldLens[field] = m
+	}
+	for docID, length := range lengths {
+		m[docID] = length
+	}
+}
+
+// IsFieldLensLoaded returns whether all field lengths for a field have been bulk-loaded.
+func (c *Cache) IsFieldLensLoaded(field string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.fieldLensLoaded[field]
+}
+
+// SetFieldLensAll bulk-sets all field lengths for a field and marks it as fully loaded.
+func (c *Cache) SetFieldLensAll(field string, lengths map[string]int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fieldLens[field] = lengths
+	c.fieldLensLoaded[field] = true
+}
+
+// GetTermVec returns a cached term vector, or nil if not cached.
+func (c *Cache) GetTermVec(field, docID, term string) (*TermVector, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := field + "\x00" + docID + "\x00" + term
+	v, ok := c.termVecs[key]
+	return v, ok
+}
+
+// SetTermVec caches a term vector.
+func (c *Cache) SetTermVec(field, docID, term string, tv *TermVector) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := field + "\x00" + docID + "\x00" + term
+	c.termVecs[key] = tv
+}
+
 // GetDocFreq returns a cached document frequency, or (0, false) if not cached.
 func (c *Cache) GetDocFreq(field, term string) (uint64, bool) {
 	c.mu.RLock()
@@ -176,9 +230,10 @@ func (c *Cache) InvalidateField(field string) {
 	defer c.mu.Unlock()
 	delete(c.termDict, field)
 	delete(c.fieldLens, field)
+	delete(c.fieldLensLoaded, field)
 	delete(c.avgFieldLen, field)
 	c.docCount = -1
-	// Remove all postings and docFreqs for this field.
+	// Remove all postings, docFreqs, and termVecs for this field.
 	prefix := field + "\x00"
 	newLRU := c.postingsLRU[:0]
 	for _, key := range c.postingsLRU {
@@ -190,6 +245,11 @@ func (c *Cache) InvalidateField(field string) {
 		}
 	}
 	c.postingsLRU = newLRU
+	for key := range c.termVecs {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			delete(c.termVecs, key)
+		}
+	}
 }
 
 // InvalidateFieldPrefix clears all caches for fields that start with prefix.
@@ -206,6 +266,7 @@ func (c *Cache) InvalidateFieldPrefix(prefix string) {
 	for field := range c.fieldLens {
 		if len(field) >= len(prefix) && field[:len(prefix)] == prefix {
 			delete(c.fieldLens, field)
+			delete(c.fieldLensLoaded, field)
 		}
 	}
 	for field := range c.avgFieldLen {
@@ -223,6 +284,11 @@ func (c *Cache) InvalidateFieldPrefix(prefix string) {
 		}
 	}
 	c.postingsLRU = newLRU
+	for key := range c.termVecs {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			delete(c.termVecs, key)
+		}
+	}
 }
 
 // InvalidateAll clears all caches (called on batch operations).
@@ -233,9 +299,11 @@ func (c *Cache) InvalidateAll() {
 	c.postings = make(map[string][]Posting)
 	c.postingsLRU = c.postingsLRU[:0]
 	c.fieldLens = make(map[string]map[string]int)
+	c.fieldLensLoaded = make(map[string]bool)
 	c.docFreqs = make(map[string]uint64)
 	c.avgFieldLen = make(map[string]float64)
 	c.docCount = -1
+	c.termVecs = make(map[string]*TermVector)
 }
 
 // --- Integration with Index ---
@@ -252,7 +320,7 @@ func (idx *Index) cachedTermsForField(field string) ([]string, error) {
 	startAfter := ""
 
 	for {
-		results, err := idx.store.List(storemd.ListArgs{
+		results, err := idx.store.List(context.Background(), storemd.ListArgs{
 			Prefix:     prefix,
 			StartAfter: startAfter,
 			Limit:      termListBatchSize,
@@ -295,7 +363,7 @@ func (idx *Index) cachedTermPostings(field, term string) ([]Posting, error) {
 	}
 
 	prefix := termFieldPrefix(field, term)
-	results, err := idx.store.List(storemd.ListArgs{Prefix: prefix})
+	results, err := idx.store.List(context.Background(), storemd.ListArgs{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}
