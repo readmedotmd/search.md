@@ -43,6 +43,10 @@ type IndexReader interface {
 	DateTimeRange(field string, start, end *time.Time) ([]string, error)
 	GetNumericValue(field, docID string) (float64, bool)
 	GetDateTimeValue(field, docID string) (time.Time, bool)
+
+	// Optimized search methods
+	FuzzyTerms(field, term string, maxDist int) ([]string, error)
+	HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool)
 }
 
 // Scorer computes relevance scores for matched documents.

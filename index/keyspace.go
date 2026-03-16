@@ -1,5 +1,10 @@
 package index
 
+import (
+	"strings"
+	"time"
+)
+
 // keyspace.go centralizes KV key construction for the search index.
 // All key format conventions are defined here so that index.go and
 // field indexer files reference helpers instead of inlining prefixes.
@@ -90,6 +95,69 @@ func dateTimeKey(field, id string) string {
 // dateTimeFieldPrefix returns the prefix for all datetime values in a field.
 func dateTimeFieldPrefix(field string) string {
 	return prefixDateTime + field + "/"
+}
+
+// --- Sorted numeric keys: ns/{field}/{sortableValue}/{id} ---
+
+// numericSortedKey returns the sorted-index key for a numeric value.
+func numericSortedKey(field string, val float64, id string) string {
+	return prefixNumericSorted + field + "/" + sortableFloat64Key(val) + "/" + id
+}
+
+// numericSortedFieldPrefix returns the prefix for all sorted numeric entries in a field.
+func numericSortedFieldPrefix(field string) string {
+	return prefixNumericSorted + field + "/"
+}
+
+// numericSortedKeyBefore returns a key just before the given value for StartAfter.
+func numericSortedKeyBefore(field string, val float64) string {
+	return prefixNumericSorted + field + "/" + sortableFloat64Key(val)
+}
+
+// numericSortedKeyAfter returns a key just after the given value for max bound check.
+func numericSortedKeyAfter(field string, val float64) string {
+	return prefixNumericSorted + field + "/" + sortableFloat64Key(val) + "/\xff"
+}
+
+// numericSortedDocID extracts the docID from a sorted numeric key.
+func numericSortedDocID(key string) string {
+	// key: ns/{field}/{16hexchars}/{docID}
+	i := strings.LastIndex(key, "/")
+	if i < 0 {
+		return ""
+	}
+	return key[i+1:]
+}
+
+// --- Sorted datetime keys: ds/{field}/{sortableNanos}/{id} ---
+
+// dateTimeSortedKey returns the sorted-index key for a datetime value.
+func dateTimeSortedKey(field string, nanos int64, id string) string {
+	return prefixDateTimeSorted + field + "/" + sortableFloat64Key(float64(nanos)) + "/" + id
+}
+
+// dateTimeSortedFieldPrefix returns the prefix for all sorted datetime entries in a field.
+func dateTimeSortedFieldPrefix(field string) string {
+	return prefixDateTimeSorted + field + "/"
+}
+
+// dateTimeSortedKeyBefore returns a key just before the given time for StartAfter.
+func dateTimeSortedKeyBefore(field string, t time.Time) string {
+	return prefixDateTimeSorted + field + "/" + sortableFloat64Key(float64(t.UnixNano()))
+}
+
+// dateTimeSortedKeyAfter returns a key just after the given time for max bound check.
+func dateTimeSortedKeyAfter(field string, t time.Time) string {
+	return prefixDateTimeSorted + field + "/" + sortableFloat64Key(float64(t.UnixNano())) + "/\xff"
+}
+
+// dateTimeSortedDocID extracts the docID from a sorted datetime key.
+func dateTimeSortedDocID(key string) string {
+	i := strings.LastIndex(key, "/")
+	if i < 0 {
+		return ""
+	}
+	return key[i+1:]
 }
 
 // --- Boolean keys: bool/{field}/{id} ---

@@ -36,8 +36,12 @@ const (
 	prefixTermVec = "tv/"
 	// num/{field}/{docID} -> numeric value
 	prefixNumeric = "num/"
+	// ns/{field}/{sortableValue}/{docID} -> "" (sorted numeric index for range scans)
+	prefixNumericSorted = "ns/"
 	// dt/{field}/{docID} -> datetime value (unix nano)
 	prefixDateTime = "dt/"
+	// ds/{field}/{sortableNanos}/{docID} -> "" (sorted datetime index for range scans)
+	prefixDateTimeSorted = "ds/"
 	// bool/{field}/{docID} -> boolean value
 	prefixBool = "bool/"
 	// ri/{docID} -> JSON array of {field, type, terms} for targeted deletion
@@ -87,6 +91,9 @@ type Index struct {
 	fieldIndexers map[string]FieldIndexer // type name -> indexer
 	helpers       IndexHelpers
 	logger        Logger
+	cache         *Cache               // term dictionary + posting list cache
+	bkTrees       map[string]*bkTree   // field -> BK-tree for fuzzy search
+	hnswIndices   map[string]*HNSW     // field -> HNSW index for KNN search
 }
 
 // SetLogger sets the logger used by the index. Pass NopLogger{} to suppress output.
@@ -102,6 +109,9 @@ func New(store storemd.Store) (*Index, error) {
 		store:         store,
 		fieldIndexers: make(map[string]FieldIndexer),
 		logger:        DefaultLogger{},
+		cache:         newCache(),
+		bkTrees:       make(map[string]*bkTree),
+		hnswIndices:   make(map[string]*HNSW),
 	}
 	idx.helpers = &indexHelpersImpl{idx: idx}
 
@@ -229,6 +239,39 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 		}
 	}
 
+	// Invalidate caches and update in-memory indices for indexed fields.
+	for _, entry := range revEntries {
+		// Invalidate term dictionary and posting caches for any field type
+		// that uses term postings (text, symbol, keyword, code, tag, etc.).
+		if len(entry.Terms) > 0 {
+			// Use prefix invalidation to cover plugin sub-fields
+			// (e.g., "symbols" invalidates "symbols.sym", "symbols.kind", etc.).
+			idx.cache.InvalidateFieldPrefix(entry.Field)
+			// Also invalidate BK-trees for any field matching the prefix.
+			for k := range idx.bkTrees {
+				if len(k) >= len(entry.Field) && k[:len(entry.Field)] == entry.Field {
+					delete(idx.bkTrees, k)
+				}
+			}
+		}
+		if entry.Type == "vector" {
+			// Update HNSW index for vector fields.
+			for _, field := range doc.Fields {
+				if field.Name == entry.Field {
+					if vec, ok := field.VectorValue(); ok {
+						hnsw, exists := idx.hnswIndices[entry.Field]
+						if !exists {
+							hnsw = NewHNSW(len(vec))
+							idx.hnswIndices[entry.Field] = hnsw
+						}
+						hnsw.Insert(doc.ID, vec)
+					}
+					break
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -275,6 +318,22 @@ func (idx *Index) deleteDocInternal(docID string) (bool, error) {
 			if err := idx.deleteDocWithRevIdx(docID, entries); err != nil {
 				return false, err
 			}
+			// Invalidate caches and in-memory indices.
+			for _, entry := range entries {
+				if len(entry.Terms) > 0 {
+					idx.cache.InvalidateFieldPrefix(entry.Field)
+					for k := range idx.bkTrees {
+						if len(k) >= len(entry.Field) && k[:len(entry.Field)] == entry.Field {
+							delete(idx.bkTrees, k)
+						}
+					}
+				}
+				if entry.Type == "vector" {
+					if hnsw, ok := idx.hnswIndices[entry.Field]; ok {
+						hnsw.Delete(docID)
+					}
+				}
+			}
 			if err := deleteKey(idx.store, revIdxKey(docID)); err != nil {
 				return false, fmt.Errorf("delete reverse index: %w", err)
 			}
@@ -286,6 +345,12 @@ func (idx *Index) deleteDocInternal(docID string) (bool, error) {
 	// the reverse index was added.
 	if err := idx.deleteDocFullScan(docID); err != nil {
 		return false, err
+	}
+	// Full-scan fallback: invalidate all caches since we don't know which fields changed.
+	idx.cache.InvalidateAll()
+	idx.bkTrees = make(map[string]*bkTree)
+	for _, hnsw := range idx.hnswIndices {
+		hnsw.Delete(docID)
 	}
 	return true, nil
 }
@@ -422,6 +487,17 @@ func (idx *Index) deleteDocFullScan(docID string) error {
 	}); err != nil {
 		return fmt.Errorf("list numeric values: %w", err)
 	}
+	// Delete sorted numeric index
+	if err := idx.forEachWithPrefix(prefixNumericSorted, func(key, value string) error {
+		if strings.HasSuffix(key, suffix) {
+			if err := deleteKey(idx.store, key); err != nil {
+				return fmt.Errorf("delete sorted numeric: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("list sorted numeric: %w", err)
+	}
 
 	// Delete datetime values
 	if err := idx.forEachWithPrefix(prefixDateTime, func(key, value string) error {
@@ -433,6 +509,17 @@ func (idx *Index) deleteDocFullScan(docID string) error {
 		return nil
 	}); err != nil {
 		return fmt.Errorf("list datetime values: %w", err)
+	}
+	// Delete sorted datetime index
+	if err := idx.forEachWithPrefix(prefixDateTimeSorted, func(key, value string) error {
+		if strings.HasSuffix(key, suffix) {
+			if err := deleteKey(idx.store, key); err != nil {
+				return fmt.Errorf("delete sorted datetime: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("list sorted datetime: %w", err)
 	}
 
 	// Delete boolean values
@@ -464,9 +551,17 @@ func (idx *Index) GetDocument(docID string) (*document.StoredData, error) {
 
 // DocCount returns the total number of indexed documents.
 func (idx *Index) DocCount() (uint64, error) {
+	if v, ok := idx.cache.GetDocCount(); ok {
+		return uint64(v), nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.getDocCount()
+	v, err := idx.getDocCount()
+	if err != nil {
+		return 0, err
+	}
+	idx.cache.SetDocCount(int64(v))
+	return v, nil
 }
 
 func (idx *Index) getDocCount() (uint64, error) {
@@ -489,21 +584,7 @@ func (idx *Index) TermPostings(field, term string) ([]Posting, error) {
 }
 
 func (idx *Index) termPostings(field, term string) ([]Posting, error) {
-	prefix := termFieldPrefix(field, term)
-	results, err := idx.store.List(storemd.ListArgs{Prefix: prefix})
-	if err != nil {
-		return nil, err
-	}
-
-	postings := make([]Posting, 0, len(results))
-	for _, kv := range results {
-		var p Posting
-		if err := json.Unmarshal([]byte(kv.Value), &p); err != nil {
-			continue
-		}
-		postings = append(postings, p)
-	}
-	return postings, nil
+	return idx.cachedTermPostings(field, term)
 }
 
 // termListBatchSize is the number of KV entries fetched per batch when
@@ -511,102 +592,50 @@ func (idx *Index) termPostings(field, term string) ([]Posting, error) {
 const termListBatchSize = 1000
 
 // TermsForField returns all unique terms in a field.
+// Uses the in-memory term dictionary cache to avoid repeated KV scans.
 func (idx *Index) TermsForField(field string) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-
-	prefix := termFieldOnlyPrefix(field)
-	termSet := make(map[string]struct{})
-	startAfter := ""
-
-	for {
-		results, err := idx.store.List(storemd.ListArgs{
-			Prefix:     prefix,
-			StartAfter: startAfter,
-			Limit:      termListBatchSize,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(results) == 0 {
-			break
-		}
-
-		for _, kv := range results {
-			// Key: t/{field}/{term}/{docID}
-			rest := strings.TrimPrefix(kv.Key, prefix)
-			slashIdx := strings.LastIndex(rest, "/")
-			if slashIdx > 0 {
-				term := rest[:slashIdx]
-				termSet[term] = struct{}{}
-			}
-		}
-
-		startAfter = results[len(results)-1].Key
-		if len(results) < termListBatchSize {
-			break
-		}
-	}
-
-	terms := make([]string, 0, len(termSet))
-	for term := range termSet {
-		terms = append(terms, term)
-	}
-	sort.Strings(terms)
-	return terms, nil
+	return idx.cachedTermsForField(field)
 }
 
 // TermsWithPrefix returns all terms in a field starting with the given prefix.
+// TermsWithPrefix returns all terms in a field starting with the given prefix.
+// Uses the cached term dictionary with binary search for O(log N + results).
 func (idx *Index) TermsWithPrefix(field, termPrefix string) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
-	prefix := termFieldOnlyPrefix(field) + termPrefix
-	termSet := make(map[string]struct{})
-	fieldPrefix := termFieldOnlyPrefix(field)
-	startAfter := ""
-
-	for {
-		results, err := idx.store.List(storemd.ListArgs{
-			Prefix:     prefix,
-			StartAfter: startAfter,
-			Limit:      termListBatchSize,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(results) == 0 {
-			break
-		}
-
-		for _, kv := range results {
-			rest := strings.TrimPrefix(kv.Key, fieldPrefix)
-			slashIdx := strings.LastIndex(rest, "/")
-			if slashIdx > 0 {
-				term := rest[:slashIdx]
-				termSet[term] = struct{}{}
-			}
-		}
-
-		startAfter = results[len(results)-1].Key
-		if len(results) < termListBatchSize {
-			break
-		}
+	allTerms, err := idx.cachedTermsForField(field)
+	if err != nil {
+		return nil, err
 	}
 
-	terms := make([]string, 0, len(termSet))
-	for term := range termSet {
-		terms = append(terms, term)
+	// Binary search to find the start of matching terms.
+	start := sort.SearchStrings(allTerms, termPrefix)
+	var result []string
+	for i := start; i < len(allTerms); i++ {
+		if len(allTerms[i]) < len(termPrefix) || allTerms[i][:len(termPrefix)] != termPrefix {
+			break
+		}
+		result = append(result, allTerms[i])
 	}
-	sort.Strings(terms)
-	return terms, nil
+	return result, nil
 }
 
 // DocumentFrequency returns the number of documents containing a term in a field.
 func (idx *Index) DocumentFrequency(field, term string) (uint64, error) {
+	if v, ok := idx.cache.GetDocFreq(field, term); ok {
+		return v, nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.docFreq(field, term)
+	v, err := idx.docFreq(field, term)
+	if err != nil {
+		return 0, err
+	}
+	idx.cache.SetDocFreq(field, term, v)
+	return v, nil
 }
 
 func (idx *Index) docFreq(field, term string) (uint64, error) {
@@ -639,19 +668,36 @@ func (idx *Index) decrementDocFreq(field, term string) error {
 
 // FieldLength returns the length (token count) of a field in a document.
 func (idx *Index) FieldLength(field, docID string) (int, error) {
+	if v, ok := idx.cache.GetFieldLen(field, docID); ok {
+		return v, nil
+	}
 	key := fieldLenKey(field, docID)
 	val, err := idx.store.Get(key)
 	if err != nil {
+		idx.cache.SetFieldLen(field, docID, 0)
 		return 0, nil
 	}
-	return strconv.Atoi(val)
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, err
+	}
+	idx.cache.SetFieldLen(field, docID, n)
+	return n, nil
 }
 
 // AverageFieldLength returns the average field length across all documents.
 func (idx *Index) AverageFieldLength(field string) (float64, error) {
+	if v, ok := idx.cache.GetAvgFieldLen(field); ok {
+		return v, nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.avgFieldLength(field)
+	v, err := idx.avgFieldLength(field)
+	if err != nil {
+		return 0, err
+	}
+	idx.cache.SetAvgFieldLen(field, v)
+	return v, nil
 }
 
 func (idx *Index) avgFieldLength(field string) (float64, error) {
@@ -818,11 +864,107 @@ func (idx *Index) ForEachDocID(fn func(docID string) bool) error {
 	return nil
 }
 
+// FuzzyTerms returns terms within the given edit distance using a BK-tree.
+// The BK-tree is built lazily on first access per field and cached.
+func (idx *Index) FuzzyTerms(field, term string, maxDist int) ([]string, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	tree, ok := idx.bkTrees[field]
+	if !ok {
+		// Build BK-tree from the cached term dictionary.
+		terms, err := idx.cachedTermsForField(field)
+		if err != nil {
+			return nil, err
+		}
+		tree = buildBKTree(terms)
+		idx.bkTrees[field] = tree
+	}
+	return tree.search(term, maxDist), nil
+}
+
+// HNSWSearch performs approximate nearest neighbor search using the HNSW index.
+// Returns docIDs and cosine similarities. Falls back to brute-force if no
+// HNSW index exists for the field.
+func (idx *Index) HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	hnsw, ok := idx.hnswIndices[field]
+	if !ok || hnsw.Size() == 0 {
+		return nil, nil, false
+	}
+	ef := k * 10
+	if ef < 100 {
+		ef = 100
+	}
+	ids, sims := hnsw.Search(query, k, ef)
+	return ids, sims, true
+}
+
 // NumericRange returns doc IDs with numeric values in [min, max] for a field.
+// It uses the sorted numeric index (ns/ prefix) for efficient range scans with
+// early termination, falling back to a full scan of the legacy (num/) prefix
+// if the sorted index is empty.
 func (idx *Index) NumericRange(field string, min, max *float64) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	// Try sorted index first.
+	docIDs, err := idx.numericRangeSorted(field, min, max)
+	if err != nil {
+		return nil, err
+	}
+	if len(docIDs) > 0 {
+		return docIDs, nil
+	}
+	// Fallback: legacy full scan.
+	return idx.numericRangeLegacy(field, min, max)
+}
+
+func (idx *Index) numericRangeSorted(field string, min, max *float64) ([]string, error) {
+	prefix := numericSortedFieldPrefix(field)
+	// StartAfter lets us skip below min.
+	startAfter := ""
+	if min != nil {
+		startAfter = numericSortedKeyBefore(field, *min)
+	}
+	maxKey := ""
+	if max != nil {
+		maxKey = numericSortedKeyAfter(field, *max)
+	}
+
+	var docIDs []string
+	for {
+		results, err := idx.store.List(storemd.ListArgs{
+			Prefix:     prefix,
+			StartAfter: startAfter,
+			Limit:      termListBatchSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(results) == 0 {
+			break
+		}
+		for _, kv := range results {
+			if maxKey != "" && kv.Key >= maxKey {
+				return docIDs, nil // early termination
+			}
+			docID := numericSortedDocID(kv.Key)
+			if docID != "" {
+				docIDs = append(docIDs, docID)
+			}
+		}
+		startAfter = results[len(results)-1].Key
+		if len(results) < termListBatchSize {
+			break
+		}
+	}
+	return docIDs, nil
+}
+
+func (idx *Index) numericRangeLegacy(field string, min, max *float64) ([]string, error) {
 	prefix := numericFieldPrefix(field)
 	var docIDs []string
 	startAfter := ""
@@ -861,10 +1003,66 @@ func (idx *Index) NumericRange(field string, min, max *float64) ([]string, error
 }
 
 // DateTimeRange returns doc IDs with datetime values in [start, end] for a field.
+// It uses the sorted datetime index (ds/ prefix) for efficient range scans,
+// falling back to the legacy (dt/) prefix if the sorted index is empty.
 func (idx *Index) DateTimeRange(field string, start, end *time.Time) ([]string, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
+	// Try sorted index first.
+	docIDs, err := idx.dateTimeRangeSorted(field, start, end)
+	if err != nil {
+		return nil, err
+	}
+	if len(docIDs) > 0 {
+		return docIDs, nil
+	}
+	// Fallback: legacy full scan.
+	return idx.dateTimeRangeLegacy(field, start, end)
+}
+
+func (idx *Index) dateTimeRangeSorted(field string, start, end *time.Time) ([]string, error) {
+	prefix := dateTimeSortedFieldPrefix(field)
+	startAfter := ""
+	if start != nil {
+		startAfter = dateTimeSortedKeyBefore(field, *start)
+	}
+	maxKey := ""
+	if end != nil {
+		maxKey = dateTimeSortedKeyAfter(field, *end)
+	}
+
+	var docIDs []string
+	for {
+		results, err := idx.store.List(storemd.ListArgs{
+			Prefix:     prefix,
+			StartAfter: startAfter,
+			Limit:      termListBatchSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(results) == 0 {
+			break
+		}
+		for _, kv := range results {
+			if maxKey != "" && kv.Key >= maxKey {
+				return docIDs, nil
+			}
+			docID := dateTimeSortedDocID(kv.Key)
+			if docID != "" {
+				docIDs = append(docIDs, docID)
+			}
+		}
+		startAfter = results[len(results)-1].Key
+		if len(results) < termListBatchSize {
+			break
+		}
+	}
+	return docIDs, nil
+}
+
+func (idx *Index) dateTimeRangeLegacy(field string, start, end *time.Time) ([]string, error) {
 	prefix := dateTimeFieldPrefix(field)
 	var docIDs []string
 	startAfter := ""

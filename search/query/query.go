@@ -239,7 +239,17 @@ func (q *FuzzyQuery) Searcher(reader plugin.IndexReader, field string, sf plugin
 	if f == "" {
 		f = field
 	}
-	return newFuzzySearcher(reader, f, strings.ToLower(q.Term), q.Fuzziness, q.Boost, sf)
+	// Analyze the term through the standard analyzer so that it is
+	// stemmed/lowercased to match the indexed term forms. Edit distance
+	// is then computed against the stemmed dictionary.
+	term := strings.ToLower(q.Term)
+	if analyzer, err := registry.AnalyzerByName("standard"); err == nil {
+		tokens := analyzer.Analyze([]byte(q.Term))
+		if len(tokens) > 0 {
+			term = tokens[0].Term
+		}
+	}
+	return newFuzzySearcher(reader, f, term, q.Fuzziness, q.Boost, sf)
 }
 
 func (q *FuzzyQuery) ExtractTerms() []string {

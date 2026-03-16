@@ -150,6 +150,12 @@ func (m *mockIndexReader) GetNumericValue(field, docID string) (float64, bool) {
 func (m *mockIndexReader) GetDateTimeValue(field, docID string) (time.Time, bool) {
 	return time.Time{}, false
 }
+func (m *mockIndexReader) FuzzyTerms(field, term string, maxDist int) ([]string, error) {
+	return nil, nil
+}
+func (m *mockIndexReader) HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool) {
+	return nil, nil, false
+}
 
 // ===========================================================================
 // HTML Highlighter Tests

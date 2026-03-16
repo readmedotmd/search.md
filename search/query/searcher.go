@@ -242,16 +242,11 @@ func newFuzzySearcher(reader plugin.IndexReader, field, term string, fuzziness i
 	if fuzziness > maxFuzziness {
 		fuzziness = maxFuzziness
 	}
-	allTerms, err := reader.TermsForField(field)
+
+	// Use BK-tree based fuzzy search (O(T^(k/log T)) instead of O(T)).
+	matchingTerms, err := reader.FuzzyTerms(field, term, fuzziness)
 	if err != nil {
 		return &fuzzySearcher{}, nil
-	}
-
-	var matchingTerms []string
-	for _, t := range allTerms {
-		if levenshteinDistance(term, t) <= fuzziness {
-			matchingTerms = append(matchingTerms, t)
-		}
 	}
 	if len(matchingTerms) > maxMatchingTerms {
 		matchingTerms = matchingTerms[:maxMatchingTerms]
@@ -810,6 +805,21 @@ func newKNNSearcher(reader plugin.IndexReader, field string, queryVec []float32,
 		k = 10
 	}
 
+	// Try HNSW approximate search first (O(log N) vs O(N)).
+	if ids, sims, ok := reader.HNSWSearch(field, queryVec, k); ok && len(ids) > 0 {
+		results := make([]*plugin.DocumentScore, len(ids))
+		maxSim := sims[0]
+		for i, id := range ids {
+			score := sims[i]
+			if maxSim > 0 {
+				score = (score / maxSim) * boost
+			}
+			results[i] = &plugin.DocumentScore{ID: id, Score: score}
+		}
+		return &knnSearcher{results: results}, nil
+	}
+
+	// Fallback: brute-force scan.
 	h := &scoreMinHeap{}
 	heap.Init(h)
 

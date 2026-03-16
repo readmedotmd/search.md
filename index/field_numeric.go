@@ -16,13 +16,27 @@ func (fi *NumericFieldIndexer) IndexField(helpers IndexHelpers, docID string, fi
 	if !ok {
 		return nil, nil
 	}
+	store := helpers.Store()
+	// Legacy key for point lookups (GetNumericValue).
 	key := numericKey(field.Name, docID)
-	if err := helpers.Store().Set(key, strconv.FormatFloat(val, 'g', -1, 64)); err != nil {
+	if err := store.Set(key, strconv.FormatFloat(val, 'g', -1, 64)); err != nil {
+		return nil, err
+	}
+	// Sorted key for efficient range scans.
+	sortedKey := numericSortedKey(field.Name, val, docID)
+	if err := store.Set(sortedKey, ""); err != nil {
 		return nil, err
 	}
 	return &RevIdxEntry{Field: field.Name, Type: "numeric"}, nil
 }
 
 func (fi *NumericFieldIndexer) DeleteField(helpers IndexHelpers, docID string, entry RevIdxEntry) error {
-	return deleteKey(helpers.Store(), numericKey(entry.Field, docID))
+	store := helpers.Store()
+	// Read the value to reconstruct the sorted key.
+	if valStr, err := store.Get(numericKey(entry.Field, docID)); err == nil {
+		if val, err := strconv.ParseFloat(valStr, 64); err == nil {
+			deleteKey(store, numericSortedKey(entry.Field, val, docID))
+		}
+	}
+	return deleteKey(store, numericKey(entry.Field, docID))
 }

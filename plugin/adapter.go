@@ -91,3 +91,11 @@ func (a *IndexAdapter) GetNumericValue(field, docID string) (float64, bool) {
 func (a *IndexAdapter) GetDateTimeValue(field, docID string) (time.Time, bool) {
 	return a.Idx.GetDateTimeValue(field, docID)
 }
+
+func (a *IndexAdapter) FuzzyTerms(field, term string, maxDist int) ([]string, error) {
+	return a.Idx.FuzzyTerms(field, term, maxDist)
+}
+
+func (a *IndexAdapter) HNSWSearch(field string, query []float32, k int) ([]string, []float64, bool) {
+	return a.Idx.HNSWSearch(field, query, k)
+}
