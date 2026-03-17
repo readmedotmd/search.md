@@ -263,17 +263,81 @@ func (b *Batch) Delete(id string) {
 
 // Execute runs all operations in the batch atomically with respect to readers.
 func (b *Batch) Execute() error {
+	// Phase 1: Prepare documents in parallel (MapDocument is read-only on mapping).
+	type preparedDoc struct {
+		doc *document.Document
+		err error
+	}
+	indexOps := make([]struct {
+		idx  int
+		op   batchOp
+		prep preparedDoc
+	}, 0, len(b.ops))
+	for i, op := range b.ops {
+		if !op.isDelete {
+			indexOps = append(indexOps, struct {
+				idx  int
+				op   batchOp
+				prep preparedDoc
+			}{idx: i, op: op})
+		}
+	}
+
+	// Parallelize document mapping for batches with enough work.
+	if len(indexOps) > 1 {
+		var wg sync.WaitGroup
+		for i := range indexOps {
+			wg.Add(1)
+			go func(j int) {
+				defer wg.Done()
+				op := &indexOps[j]
+				if err := validateID(op.op.id); err != nil {
+					op.prep.err = err
+					return
+				}
+				doc := document.NewDocument(op.op.id)
+				if err := b.si.mapping.MapDocument(doc, op.op.data); err != nil {
+					op.prep.err = fmt.Errorf("map document: %w", err)
+					return
+				}
+				op.prep.doc = doc
+			}(i)
+		}
+		wg.Wait()
+
+		// Check for preparation errors.
+		for _, op := range indexOps {
+			if op.prep.err != nil {
+				return op.prep.err
+			}
+		}
+	}
+
+	// Build a lookup from original index to prepared doc.
+	preparedByIdx := make(map[int]*document.Document, len(indexOps))
+	for i := range indexOps {
+		if indexOps[i].prep.doc != nil {
+			preparedByIdx[indexOps[i].idx] = indexOps[i].prep.doc
+		}
+	}
+
+	// Phase 2: Write to store serially under lock.
 	b.si.mu.Lock()
 	defer b.si.mu.Unlock()
-	// Enable batch mode to defer per-document cache invalidation.
 	b.si.idx.BeginBatch()
 	defer b.si.idx.EndBatch()
-	for _, op := range b.ops {
+	for i, op := range b.ops {
 		if op.isDelete {
 			if err := b.si.deleteInternal(op.id); err != nil {
 				return err
 			}
+		} else if doc, ok := preparedByIdx[i]; ok {
+			// Use pre-mapped document.
+			if err := b.si.idx.IndexDocument(doc); err != nil {
+				return err
+			}
 		} else {
+			// Single-doc batch or fallback.
 			if err := b.si.indexInternal(op.id, op.data); err != nil {
 				return err
 			}
@@ -349,6 +413,9 @@ func (si *SearchIndex) SearchWithRequest(ctx context.Context, req *search.Search
 
 	var totalHits uint64
 	maxScore := 0.0
+
+	// Pre-allocate heap backing storage to avoid per-push allocation.
+	heapBacking := make([]search.DocumentMatch, 0, heapCap)
 	h := &scoreHeap{}
 	heap.Init(h)
 
@@ -385,9 +452,12 @@ func (si *SearchIndex) SearchWithRequest(ctx context.Context, req *search.Search
 		}
 
 		if h.Len() < heapCap {
-			heap.Push(h, &search.DocumentMatch{ID: ds.ID, Score: ds.Score})
+			heapBacking = append(heapBacking, search.DocumentMatch{ID: ds.ID, Score: ds.Score})
+			heap.Push(h, &heapBacking[len(heapBacking)-1])
 		} else if ds.Score > (*h)[0].Score {
-			(*h)[0] = &search.DocumentMatch{ID: ds.ID, Score: ds.Score}
+			entry := (*h)[0]
+			entry.ID = ds.ID
+			entry.Score = ds.Score
 			heap.Fix(h, 0)
 		}
 	}

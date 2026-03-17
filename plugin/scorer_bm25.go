@@ -16,42 +16,41 @@ func DefaultBM25() *BM25ScorerFactory {
 func (f *BM25ScorerFactory) Name() string { return "bm25" }
 
 func (f *BM25ScorerFactory) NewScorer(docCount, docFreq uint64, avgFieldLength float64) Scorer {
+	// Pre-compute IDF since it's constant per term.
+	n := float64(docFreq)
+	N := float64(docCount)
+	idf := math.Log(1 + (N-n+0.5)/(n+0.5))
+
+	avgdl := avgFieldLength
+	if avgdl == 0 {
+		avgdl = 1
+	}
+	// Pre-compute the base normalization factor: k1 * (1 - b)
+	k1TimesOneMinusB := f.K1 * (1 - f.B)
+	k1TimesBDivAvgdl := f.K1 * f.B / avgdl
+
 	return &bm25Scorer{
-		K1:             f.K1,
-		B:              f.B,
-		DocCount:       docCount,
-		DocFreq:        docFreq,
-		AvgFieldLength: avgFieldLength,
+		K1:                f.K1,
+		idf:               idf,
+		k1Plus1:           f.K1 + 1,
+		k1TimesOneMinusB:  k1TimesOneMinusB,
+		k1TimesBDivAvgdl:  k1TimesBDivAvgdl,
 	}
 }
 
-// bm25Scorer implements Okapi BM25 scoring.
+// bm25Scorer implements Okapi BM25 scoring with pre-computed constants.
 type bm25Scorer struct {
-	// BM25 parameters
-	K1 float64 // term frequency saturation parameter (default 1.2)
-	B  float64 // field length normalization parameter (default 0.75)
-
-	// Index statistics
-	DocCount       uint64  // total number of documents
-	DocFreq        uint64  // number of documents containing the term
-	AvgFieldLength float64 // average field length
+	K1                float64
+	idf               float64 // pre-computed IDF
+	k1Plus1           float64 // k1 + 1
+	k1TimesOneMinusB  float64 // k1 * (1 - b)
+	k1TimesBDivAvgdl  float64 // k1 * b / avgdl
 }
 
 // Score calculates the BM25 score for a document.
 func (s *bm25Scorer) Score(termFreq int, fieldLength int, boost float64) float64 {
-	// IDF component: log(1 + (N - n + 0.5) / (n + 0.5))
-	n := float64(s.DocFreq)
-	N := float64(s.DocCount)
-	idf := math.Log(1 + (N-n+0.5)/(n+0.5))
-
-	// TF component: (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl/avgdl))
 	tf := float64(termFreq)
 	dl := float64(fieldLength)
-	avgdl := s.AvgFieldLength
-	if avgdl == 0 {
-		avgdl = 1
-	}
-	tfNorm := (tf * (s.K1 + 1)) / (tf + s.K1*(1-s.B+s.B*dl/avgdl))
-
-	return idf * tfNorm * boost
+	tfNorm := (tf * s.k1Plus1) / (tf + s.k1TimesOneMinusB + s.k1TimesBDivAvgdl*dl)
+	return s.idf * tfNorm * boost
 }

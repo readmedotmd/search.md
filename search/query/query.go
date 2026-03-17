@@ -115,19 +115,25 @@ func (q *MatchQuery) Searcher(reader plugin.IndexReader, field string, sf plugin
 		return newTermSearcher(reader, f, tokens[0].Term, q.Boost, sf)
 	}
 
-	// Multiple terms: create sub-queries
-	queries := make([]Query, len(tokens))
+	// Multiple terms: extract term strings.
+	terms := make([]string, len(tokens))
 	for i, t := range tokens {
-		queries[i] = &TermQuery{Term: t.Term, Field: f, Boost: q.Boost}
+		terms[i] = t.Term
 	}
 
 	if q.Operator == "and" {
+		queries := make([]Query, len(tokens))
+		for i, t := range tokens {
+			queries[i] = &TermQuery{Term: t.Term, Field: f, Boost: q.Boost}
+		}
 		conj := &ConjunctionQuery{Conjuncts: queries, Boost: 1.0}
 		return conj.Searcher(reader, f, sf)
 	}
 
-	disj := &DisjunctionQuery{Disjuncts: queries, Min: 1, Boost: 1.0}
-	return disj.Searcher(reader, f, sf)
+	// Fused multi-term OR: score all terms' postings directly without
+	// creating intermediate searchers or using map accumulation.
+	results := scoreMultiTerms(reader, f, terms, q.Boost, sf)
+	return &disjunctionSearcher{results: results}, nil
 }
 
 func (q *MatchQuery) ExtractTerms() []string {

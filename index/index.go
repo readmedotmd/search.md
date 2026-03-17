@@ -61,6 +61,21 @@ type Posting struct {
 	Norm      float64 `json:"n"` // 1/sqrt(fieldLength)
 }
 
+// MarshalPosting serializes a Posting to JSON without reflection.
+func MarshalPosting(p *Posting) string {
+	// Produce: {"d":"<docID>","f":<freq>,"n":<norm>}
+	// Pre-allocate enough for typical postings to avoid slice growth.
+	buf := make([]byte, 0, len(p.DocID)+48)
+	buf = append(buf, `{"d":"`...)
+	buf = append(buf, p.DocID...)
+	buf = append(buf, `","f":`...)
+	buf = strconv.AppendInt(buf, int64(p.Frequency), 10)
+	buf = append(buf, `,"n":`...)
+	buf = strconv.AppendFloat(buf, p.Norm, 'g', -1, 64)
+	buf = append(buf, '}')
+	return string(buf)
+}
+
 // TermVector stores position information for highlighting and phrase queries.
 type TermVector struct {
 	Positions []analysis.TokenPosition `json:"p"`

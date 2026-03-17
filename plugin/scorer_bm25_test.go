@@ -7,13 +7,8 @@ import (
 
 // newTestBM25Scorer creates a bm25Scorer with default K1/B for testing.
 func newTestBM25Scorer(docCount, docFreq uint64, avgFieldLength float64) *bm25Scorer {
-	return &bm25Scorer{
-		K1:             1.2,
-		B:              0.75,
-		DocCount:       docCount,
-		DocFreq:        docFreq,
-		AvgFieldLength: avgFieldLength,
-	}
+	f := &BM25ScorerFactory{K1: 1.2, B: 0.75}
+	return f.NewScorer(docCount, docFreq, avgFieldLength).(*bm25Scorer)
 }
 
 // --- BM25Scorer.Score tests ---
@@ -110,16 +105,12 @@ func TestNewBM25Scorer_Defaults(t *testing.T) {
 	if s.K1 != 1.2 {
 		t.Errorf("expected K1=1.2, got %f", s.K1)
 	}
-	if s.B != 0.75 {
-		t.Errorf("expected B=0.75, got %f", s.B)
+	// Verify pre-computed IDF
+	expectedIDF := math.Log(1 + (100.0-10.0+0.5)/(10.0+0.5))
+	if math.Abs(s.idf-expectedIDF) > 1e-10 {
+		t.Errorf("expected idf=%f, got %f", expectedIDF, s.idf)
 	}
-	if s.DocCount != 100 {
-		t.Errorf("expected DocCount=100, got %d", s.DocCount)
-	}
-	if s.DocFreq != 10 {
-		t.Errorf("expected DocFreq=10, got %d", s.DocFreq)
-	}
-	if s.AvgFieldLength != 50.0 {
-		t.Errorf("expected AvgFieldLength=50.0, got %f", s.AvgFieldLength)
+	if s.k1Plus1 != 2.2 {
+		t.Errorf("expected k1Plus1=2.2, got %f", s.k1Plus1)
 	}
 }

@@ -52,13 +52,9 @@ func (fi *TextFieldIndexer) IndexField(helpers IndexHelpers, docID string, field
 			Frequency: tf.Frequency,
 			Norm:      norm,
 		}
-		postingJSON, err := json.Marshal(posting)
-		if err != nil {
-			return nil, err
-		}
 
 		key := termKey(field.Name, term, docID)
-		if err := store.Set(ctx, key, string(postingJSON)); err != nil {
+		if err := store.Set(ctx, key, MarshalPosting(&posting)); err != nil {
 			return nil, err
 		}
 

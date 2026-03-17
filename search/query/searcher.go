@@ -27,7 +27,7 @@ func (h *scoreMinHeap) Pop() interface{} {
 
 // termSearcher searches for a single term.
 type termSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -72,32 +72,26 @@ func newTermSearcher(reader plugin.IndexReader, field, term string, boost float6
 	s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 
 	// Batch-fetch field lengths in one call to minimize lock acquisitions.
-	// Reuse postings slice to extract docIDs without extra allocation.
 	docIDs := make([]string, len(postings))
 	for i, p := range postings {
 		docIDs[i] = p.DocID
 	}
 	fieldLens, _ := reader.BatchGetFieldLengths(field, docIDs)
 
-	// Score all postings into a single backing slice, then build pointer slice.
+	// Score all postings into a single backing slice. No sort needed —
+	// callers either use a top-K heap or accumulate into maps.
 	n := len(postings)
-	scored := make([]plugin.DocumentScore, n)
-	results := make([]*plugin.DocumentScore, n)
+	results := make([]plugin.DocumentScore, n)
 	for i, p := range postings {
 		fieldLen := fieldLens[p.DocID]
 		if fieldLen == 0 {
 			fieldLen = 1
 		}
-		scored[i] = plugin.DocumentScore{
+		results[i] = plugin.DocumentScore{
 			ID:    p.DocID,
 			Score: s.Score(p.Frequency, fieldLen, boost),
 		}
-		results[i] = &scored[i]
 	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
 
 	return &termSearcher{results: results}, nil
 }
@@ -106,7 +100,7 @@ func (s *termSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -117,7 +111,7 @@ func (s *termSearcher) Count() int {
 
 // phraseSearcher searches for an exact phrase using term vectors.
 type phraseSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -143,27 +137,18 @@ func newPhraseSearcher(reader plugin.IndexReader, field string, terms []string, 
 	}
 	fieldLens, _ := reader.BatchGetFieldLengths(field, candidateDocIDs)
 
-	var scored []plugin.DocumentScore
+	var results []plugin.DocumentScore
 
 	for _, fp := range firstPostings {
 		docID := fp.DocID
 
 		if containsPhrase(reader, field, docID, terms) {
 			fieldLen := fieldLens[docID]
-			scored = append(scored, plugin.DocumentScore{
+			results = append(results, plugin.DocumentScore{
 				ID:    docID,
 				Score: s.Score(fp.Frequency, fieldLen, boost),
 			})
 		}
-	}
-
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	results := make([]*plugin.DocumentScore, len(scored))
-	for i := range scored {
-		results[i] = &scored[i]
 	}
 
 	return &phraseSearcher{results: results}, nil
@@ -208,7 +193,7 @@ func (s *phraseSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -219,7 +204,7 @@ func (s *phraseSearcher) Count() int {
 
 // prefixSearcher searches for terms starting with a prefix.
 type prefixSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -240,7 +225,7 @@ func (s *prefixSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -251,7 +236,7 @@ func (s *prefixSearcher) Count() int {
 
 // fuzzySearcher searches for terms within edit distance.
 type fuzzySearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -287,7 +272,7 @@ func (s *fuzzySearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -335,23 +320,54 @@ func levenshteinDistance(a, b string) int {
 // scoreMultiTerms is a shared helper for prefix, fuzzy, and regexp searchers.
 // It scores documents across multiple matching terms efficiently by fetching
 // docCount and avgFieldLen once, and using bulk-cached field lengths.
-func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, boost float64, sf plugin.ScorerFactory) []*plugin.DocumentScore {
-	docCount, _ := reader.DocCount()
-	avgFieldLen, _ := reader.AverageFieldLength(field)
-
-	// Collect all postings first, then batch-preload field lengths.
+func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, boost float64, sf plugin.ScorerFactory) []plugin.DocumentScore {
+	// Use coalesced cache reads to minimize lock acquisitions.
+	// First term gives us docCount, avgFieldLen, and its own postings+docFreq.
 	type termPostingPair struct {
 		postings []index.Posting
 		scorer   plugin.Scorer
 	}
 	pairs := make([]termPostingPair, 0, len(terms))
 	totalPostings := 0
-	for _, term := range terms {
-		postings, _ := reader.TermPostings(field, term)
-		docFreq, _ := reader.DocumentFrequency(field, term)
+
+	var docCount uint64
+	var avgFieldLen float64
+	for i, term := range terms {
+		st := reader.GetTermSearcherState(field, term)
+		if i == 0 {
+			if st.DocCountOK {
+				docCount = uint64(st.DocCount)
+			} else {
+				docCount, _ = reader.DocCount()
+			}
+			if st.AvgFieldOK {
+				avgFieldLen = st.AvgFieldLen
+			} else {
+				avgFieldLen, _ = reader.AverageFieldLength(field)
+			}
+		}
+
+		var postings []index.Posting
+		if st.PostingsOK {
+			postings = st.Postings
+		} else {
+			postings, _ = reader.TermPostings(field, term)
+		}
+
+		var docFreq uint64
+		if st.DocFreqOK {
+			docFreq = st.DocFreq
+		} else {
+			docFreq, _ = reader.DocumentFrequency(field, term)
+		}
+
 		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 		pairs = append(pairs, termPostingPair{postings: postings, scorer: s})
 		totalPostings += len(postings)
+	}
+
+	if totalPostings == 0 {
+		return nil
 	}
 
 	// Batch-preload field lengths using a deduplicated list.
@@ -367,6 +383,7 @@ func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, bo
 	}
 	fieldLens, _ := reader.BatchGetFieldLengths(field, allDocIDs)
 
+	// Score directly into the docScores map, then convert to slice.
 	docScores := make(map[string]float64, len(allDocIDs))
 	for _, pair := range pairs {
 		for _, p := range pair.postings {
@@ -378,24 +395,16 @@ func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, bo
 		}
 	}
 
-	scored := make([]plugin.DocumentScore, 0, len(docScores))
+	results := make([]plugin.DocumentScore, 0, len(docScores))
 	for docID, score := range docScores {
-		scored = append(scored, plugin.DocumentScore{ID: docID, Score: score})
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	results := make([]*plugin.DocumentScore, len(scored))
-	for i := range scored {
-		results[i] = &scored[i]
+		results = append(results, plugin.DocumentScore{ID: docID, Score: score})
 	}
 	return results
 }
 
 // regexpSearcher searches for terms matching a regular expression.
 type regexpSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -432,7 +441,7 @@ func (s *regexpSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -443,7 +452,7 @@ func (s *regexpSearcher) Count() int {
 
 // numericRangeSearcher searches for documents with numeric values in range.
 type numericRangeSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -453,9 +462,9 @@ func newNumericRangeSearcher(reader plugin.IndexReader, field string, min, max *
 		return nil, err
 	}
 
-	results := make([]*plugin.DocumentScore, len(docIDs))
+	results := make([]plugin.DocumentScore, len(docIDs))
 	for i, docID := range docIDs {
-		results[i] = &plugin.DocumentScore{ID: docID, Score: boost}
+		results[i] = plugin.DocumentScore{ID: docID, Score: boost}
 	}
 
 	return &numericRangeSearcher{results: results}, nil
@@ -465,7 +474,7 @@ func (s *numericRangeSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -476,7 +485,7 @@ func (s *numericRangeSearcher) Count() int {
 
 // dateRangeSearcher searches for documents with datetime values in range.
 type dateRangeSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -486,9 +495,9 @@ func newDateRangeSearcher(reader plugin.IndexReader, field string, start, end *t
 		return nil, err
 	}
 
-	results := make([]*plugin.DocumentScore, len(docIDs))
+	results := make([]plugin.DocumentScore, len(docIDs))
 	for i, docID := range docIDs {
-		results[i] = &plugin.DocumentScore{ID: docID, Score: boost}
+		results[i] = plugin.DocumentScore{ID: docID, Score: boost}
 	}
 
 	return &dateRangeSearcher{results: results}, nil
@@ -498,7 +507,7 @@ func (s *dateRangeSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -509,7 +518,7 @@ func (s *dateRangeSearcher) Count() int {
 
 // conjunctionSearcher requires all sub-queries to match.
 type conjunctionSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -518,7 +527,7 @@ func newConjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		return &conjunctionSearcher{}, nil
 	}
 
-	// Execute all sub-queries and sort by result count (smallest first)
+	// Execute all sub-queries and find the smallest result set first
 	// to minimize intersection work.
 	type searcherResult struct {
 		scores map[string]float64
@@ -526,6 +535,7 @@ func newConjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 	}
 
 	searchers := make([]searcherResult, len(queries))
+	minIdx := 0
 	for i, q := range queries {
 		s, err := q.Searcher(reader, field, sf)
 		if err != nil {
@@ -540,14 +550,13 @@ func newConjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 			scores[ds.ID] = ds.Score
 		}
 		searchers[i] = searcherResult{scores: scores, count: len(scores)}
+		if searchers[i].count < searchers[minIdx].count {
+			minIdx = i
+		}
 	}
 
-	// Sort by count ascending so we start with the smallest set.
-	sort.Slice(searchers, func(i, j int) bool {
-		return searchers[i].count < searchers[j].count
-	})
-
 	// Start with the smallest result set as candidates.
+	searchers[0], searchers[minIdx] = searchers[minIdx], searchers[0]
 	candidates := searchers[0].scores
 
 	// Intersect with remaining sets.
@@ -562,17 +571,9 @@ func newConjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		candidates = newCandidates
 	}
 
-	scored := make([]plugin.DocumentScore, 0, len(candidates))
+	results := make([]plugin.DocumentScore, 0, len(candidates))
 	for docID, score := range candidates {
-		scored = append(scored, plugin.DocumentScore{ID: docID, Score: score * boost})
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	results := make([]*plugin.DocumentScore, len(scored))
-	for i := range scored {
-		results[i] = &scored[i]
+		results = append(results, plugin.DocumentScore{ID: docID, Score: score * boost})
 	}
 
 	return &conjunctionSearcher{results: results}, nil
@@ -582,7 +583,7 @@ func (s *conjunctionSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -593,7 +594,7 @@ func (s *conjunctionSearcher) Count() int {
 
 // disjunctionSearcher requires at least Min sub-queries to match.
 type disjunctionSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -602,31 +603,40 @@ func newDisjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		return &disjunctionSearcher{}, nil
 	}
 
-	// For single query with minMatch=1, skip the count tracking entirely.
+	// For single query with minMatch<=1, pass through directly.
 	if len(queries) == 1 && minMatch <= 1 {
 		s, err := queries[0].Searcher(reader, field, sf)
 		if err != nil {
 			return nil, err
 		}
-		var results []*plugin.DocumentScore
+		var results []plugin.DocumentScore
 		for {
 			ds, err := s.Next()
 			if err != nil || ds == nil {
 				break
 			}
-			score := ds.Score * boost
-			results = append(results, &plugin.DocumentScore{ID: ds.ID, Score: score})
+			results = append(results, plugin.DocumentScore{ID: ds.ID, Score: ds.Score * boost})
 		}
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].Score > results[j].Score
-		})
 		return &disjunctionSearcher{results: results}, nil
 	}
 
-	// For minMatch=1 (the common case), we don't need docCounts at all.
+	// For minMatch<=1 (the common case), we don't need docCounts at all.
 	if minMatch <= 1 {
-		docScores := make(map[string]float64)
-		for _, q := range queries {
+		// Estimate capacity from first query's count.
+		firstSearcher, err := queries[0].Searcher(reader, field, sf)
+		if err != nil {
+			return nil, err
+		}
+		estSize := firstSearcher.Count()
+		docScores := make(map[string]float64, estSize)
+		for {
+			ds, err := firstSearcher.Next()
+			if err != nil || ds == nil {
+				break
+			}
+			docScores[ds.ID] = ds.Score
+		}
+		for _, q := range queries[1:] {
 			s, err := q.Searcher(reader, field, sf)
 			if err != nil {
 				return nil, err
@@ -640,16 +650,9 @@ func newDisjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 			}
 		}
 
-		scored := make([]plugin.DocumentScore, 0, len(docScores))
+		results := make([]plugin.DocumentScore, 0, len(docScores))
 		for docID, score := range docScores {
-			scored = append(scored, plugin.DocumentScore{ID: docID, Score: score * boost})
-		}
-		sort.Slice(scored, func(i, j int) bool {
-			return scored[i].Score > scored[j].Score
-		})
-		results := make([]*plugin.DocumentScore, len(scored))
-		for i := range scored {
-			results[i] = &scored[i]
+			results = append(results, plugin.DocumentScore{ID: docID, Score: score * boost})
 		}
 		return &disjunctionSearcher{results: results}, nil
 	}
@@ -677,22 +680,14 @@ func newDisjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		}
 	}
 
-	scored := make([]plugin.DocumentScore, 0, len(docCounts))
+	results := make([]plugin.DocumentScore, 0, len(docCounts))
 	for docID, count := range docCounts {
 		if count >= minMatch {
-			scored = append(scored, plugin.DocumentScore{
+			results = append(results, plugin.DocumentScore{
 				ID:    docID,
 				Score: docScores[docID] * boost,
 			})
 		}
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	results := make([]*plugin.DocumentScore, len(scored))
-	for i := range scored {
-		results[i] = &scored[i]
 	}
 	return &disjunctionSearcher{results: results}, nil
 }
@@ -701,7 +696,7 @@ func (s *disjunctionSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -712,7 +707,7 @@ func (s *disjunctionSearcher) Count() int {
 
 // booleanSearcher implements boolean query logic.
 type booleanSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -793,13 +788,10 @@ func newBooleanSearcher(reader plugin.IndexReader, field string, q *BooleanQuery
 		}
 	}
 
-	results := make([]*plugin.DocumentScore, 0, len(finalDocs))
+	results := make([]plugin.DocumentScore, 0, len(finalDocs))
 	for docID, score := range finalDocs {
-		results = append(results, &plugin.DocumentScore{ID: docID, Score: score * q.Boost})
+		results = append(results, plugin.DocumentScore{ID: docID, Score: score * q.Boost})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
 
 	return &booleanSearcher{results: results}, nil
 }
@@ -808,7 +800,7 @@ func (s *booleanSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
@@ -895,7 +887,7 @@ func (s *emptySearcher) Count() int {
 
 // knnSearcher performs k-nearest-neighbor vector search.
 type knnSearcher struct {
-	results []*plugin.DocumentScore
+	results []plugin.DocumentScore
 	pos     int
 }
 
@@ -906,14 +898,14 @@ func newKNNSearcher(reader plugin.IndexReader, field string, queryVec []float32,
 
 	// Try HNSW approximate search first (O(log N) vs O(N)).
 	if ids, sims, ok := reader.HNSWSearch(field, queryVec, k); ok && len(ids) > 0 {
-		results := make([]*plugin.DocumentScore, len(ids))
+		results := make([]plugin.DocumentScore, len(ids))
 		maxSim := sims[0]
 		for i, id := range ids {
 			score := sims[i]
 			if maxSim > 0 {
 				score = (score / maxSim) * boost
 			}
-			results[i] = &plugin.DocumentScore{ID: id, Score: score}
+			results[i] = plugin.DocumentScore{ID: id, Score: score}
 		}
 		return &knnSearcher{results: results}, nil
 	}
@@ -940,16 +932,15 @@ func newKNNSearcher(reader plugin.IndexReader, field string, queryVec []float32,
 	}
 
 	n := h.Len()
-	results := make([]*plugin.DocumentScore, n)
+	results := make([]plugin.DocumentScore, n)
 	for i := n - 1; i >= 0; i-- {
-		ds := heap.Pop(h).(plugin.DocumentScore)
-		results[i] = &ds
+		results[i] = heap.Pop(h).(plugin.DocumentScore)
 	}
 
 	maxScore := results[0].Score
-	for _, r := range results {
+	for i := range results {
 		if maxScore > 0 {
-			r.Score = (r.Score / maxScore) * boost
+			results[i].Score = (results[i].Score / maxScore) * boost
 		}
 	}
 
@@ -960,7 +951,7 @@ func (s *knnSearcher) Next() (*plugin.DocumentScore, error) {
 	if s.pos >= len(s.results) {
 		return nil, nil
 	}
-	result := s.results[s.pos]
+	result := &s.results[s.pos]
 	s.pos++
 	return result, nil
 }
