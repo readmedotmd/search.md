@@ -95,6 +95,8 @@ type Index struct {
 	cache         *Cache               // term dictionary + posting list cache
 	bkTrees       map[string]*bkTree   // field -> BK-tree for fuzzy search
 	hnswIndices   map[string]*HNSW     // field -> HNSW index for KNN search
+	batchMode     bool                 // when true, defer cache invalidation
+	inMemoryMode  bool                 // when true, cache is unlimited and eagerly warmed
 }
 
 // SetLogger sets the logger used by the index. Pass NopLogger{} to suppress output.
@@ -171,6 +173,191 @@ func fieldTypeToIndexerType(ft document.FieldType) string {
 	}
 }
 
+// BeginBatch enables batch mode, deferring cache invalidation until EndBatch.
+// Caller must hold idx.mu.Lock().
+func (idx *Index) BeginBatch() {
+	idx.batchMode = true
+}
+
+// EndBatch disables batch mode and invalidates all caches.
+// Caller must hold idx.mu.Lock().
+func (idx *Index) EndBatch() {
+	idx.batchMode = false
+	idx.cache.InvalidateAll()
+	idx.bkTrees = make(map[string]*bkTree)
+}
+
+// SetInMemoryMode enables or disables in-memory mode.
+// When enabled, the postings cache has no LRU eviction limit,
+// and WarmCache can be used to eagerly preload all index data.
+func (idx *Index) SetInMemoryMode(enabled bool) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.inMemoryMode = enabled
+	if enabled {
+		idx.cache.SetUnlimitedPostings()
+	} else {
+		idx.cache.SetMaxPostings(defaultMaxPostings)
+	}
+}
+
+// InMemoryMode returns whether in-memory mode is enabled.
+func (idx *Index) InMemoryMode() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.inMemoryMode
+}
+
+// WarmCache eagerly preloads all term dictionaries, posting lists,
+// document frequencies, field lengths, and aggregate statistics into
+// the in-memory cache. This is most effective when in-memory mode is on.
+func (idx *Index) WarmCache() error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	// 0. Preload all documents into cache.
+	if err := idx.forEachWithPrefix(prefixDoc, func(key, value string) error {
+		docID := key[len(prefixDoc):]
+		sd, err := document.UnmarshalStoredData([]byte(value))
+		if err != nil {
+			return nil // skip malformed docs
+		}
+		idx.cache.SetCachedDoc(docID, sd.Fields)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("warm cache: preload documents: %w", err)
+	}
+
+	// 1. Load doc count.
+	docCount, err := idx.getDocCount()
+	if err != nil {
+		return err
+	}
+	idx.cache.SetDocCount(int64(docCount))
+
+	// 2. Single-pass: load ALL term postings, building term dicts and posting lists.
+	fields := make(map[string]struct{})
+	termDicts := make(map[string]map[string]struct{})        // field -> set of terms
+	postingsMap := make(map[string]map[string][]Posting)     // field -> term -> postings
+	if err := idx.forEachWithPrefix(prefixTerm, func(key, value string) error {
+		// Key format: t/{field}/{term}/{docID}
+		rest := key[len(prefixTerm):]
+		slash1 := strings.IndexByte(rest, '/')
+		if slash1 < 0 {
+			return nil
+		}
+		field := rest[:slash1]
+		rest2 := rest[slash1+1:]
+		slash2 := strings.IndexByte(rest2, '/')
+		if slash2 < 0 {
+			return nil
+		}
+		term := rest2[:slash2]
+
+		fields[field] = struct{}{}
+		if termDicts[field] == nil {
+			termDicts[field] = make(map[string]struct{})
+		}
+		termDicts[field][term] = struct{}{}
+
+		p, ok := fastParsePosting(value)
+		if !ok {
+			var jp Posting
+			if json.Unmarshal([]byte(value), &jp) == nil {
+				p = jp
+			} else {
+				return nil
+			}
+		}
+		if postingsMap[field] == nil {
+			postingsMap[field] = make(map[string][]Posting)
+		}
+		postingsMap[field][term] = append(postingsMap[field][term], p)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("warm cache: scan postings: %w", err)
+	}
+
+	// Cache term dicts and postings.
+	for field, termSet := range termDicts {
+		terms := make([]string, 0, len(termSet))
+		for t := range termSet {
+			terms = append(terms, t)
+		}
+		sort.Strings(terms)
+		idx.cache.SetTermDict(field, terms)
+
+		for _, term := range terms {
+			if ps, ok := postingsMap[field][term]; ok {
+				idx.cache.SetPostings(field, term, ps)
+			}
+		}
+	}
+
+	// 3. Single-pass: load all doc frequencies.
+	if err := idx.forEachWithPrefix(prefixDocFreq, func(key, value string) error {
+		rest := key[len(prefixDocFreq):]
+		slashIdx := strings.IndexByte(rest, '/')
+		if slashIdx < 0 {
+			return nil
+		}
+		field := rest[:slashIdx]
+		term := rest[slashIdx+1:]
+		df, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return nil
+		}
+		idx.cache.SetDocFreq(field, term, df)
+		_ = field // already discovered
+		return nil
+	}); err != nil {
+		return fmt.Errorf("warm cache: scan doc freqs: %w", err)
+	}
+
+	// 4. For each field: avg field len + bulk field lengths.
+	for field := range fields {
+		avg, err := idx.avgFieldLength(field)
+		if err == nil {
+			idx.cache.SetAvgFieldLen(field, avg)
+		}
+
+		if !idx.cache.IsFieldLensLoaded(field) {
+			lengths := make(map[string]int)
+			prefix := fieldLenKey(field, "")
+			if err := idx.forEachWithPrefix(prefix, func(key, value string) error {
+				docID := key[len(prefix):]
+				n, err := strconv.Atoi(value)
+				if err != nil {
+					return nil
+				}
+				lengths[docID] = n
+				return nil
+			}); err != nil {
+				return fmt.Errorf("warm cache: field lengths %q: %w", field, err)
+			}
+			idx.cache.SetFieldLensAll(field, lengths)
+		}
+	}
+
+	return nil
+}
+
+// GetTermSearcherState returns the coalesced cache state for a term searcher.
+func (idx *Index) GetTermSearcherState(field, term string) TermSearcherState {
+	return idx.cache.GetTermSearcherState(field, term)
+}
+
+// BatchGetFieldLengths returns field lengths for multiple docIDs from cache.
+// Returns (map, true) if all were found in cache, or falls back to individual lookups.
+func (idx *Index) BatchGetFieldLengths(field string, docIDs []string) (map[string]int, bool) {
+	if m, ok := idx.cache.GetFieldLenBatch(field, docIDs); ok {
+		return m, true
+	}
+	// Fall back: preload into cache then batch-read.
+	idx.BatchFieldLengths(field, docIDs)
+	return idx.cache.GetFieldLenBatch(field, docIDs)
+}
+
 // IndexDocument indexes a document's fields into the store.
 func (idx *Index) IndexDocument(doc *document.Document) error {
 	idx.mu.Lock()
@@ -181,6 +368,9 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 	if err != nil {
 		return fmt.Errorf("delete existing document: %w", err)
 	}
+
+	// Invalidate cached document.
+	idx.cache.InvalidateDoc(doc.ID)
 
 	// Store the document data
 	storedData := doc.ToStoredData()
@@ -242,21 +432,8 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 
 	// Invalidate caches and update in-memory indices for indexed fields.
 	for _, entry := range revEntries {
-		// Invalidate term dictionary and posting caches for any field type
-		// that uses term postings (text, symbol, keyword, code, tag, etc.).
-		if len(entry.Terms) > 0 {
-			// Use prefix invalidation to cover plugin sub-fields
-			// (e.g., "symbols" invalidates "symbols.sym", "symbols.kind", etc.).
-			idx.cache.InvalidateFieldPrefix(entry.Field)
-			// Also invalidate BK-trees for any field matching the prefix.
-			for k := range idx.bkTrees {
-				if len(k) >= len(entry.Field) && k[:len(entry.Field)] == entry.Field {
-					delete(idx.bkTrees, k)
-				}
-			}
-		}
 		if entry.Type == "vector" {
-			// Update HNSW index for vector fields.
+			// Update HNSW index for vector fields (always, even in batch mode).
 			for _, field := range doc.Fields {
 				if field.Name == entry.Field {
 					if vec, ok := field.VectorValue(); ok {
@@ -268,6 +445,15 @@ func (idx *Index) IndexDocument(doc *document.Document) error {
 						hnsw.Insert(doc.ID, vec)
 					}
 					break
+				}
+			}
+		}
+		// Skip cache invalidation in batch mode — EndBatch will do it all at once.
+		if !idx.batchMode && len(entry.Terms) > 0 {
+			idx.cache.InvalidateFieldPrefix(entry.Field)
+			for k := range idx.bkTrees {
+				if len(k) >= len(entry.Field) && k[:len(entry.Field)] == entry.Field {
+					delete(idx.bkTrees, k)
 				}
 			}
 		}
@@ -540,6 +726,11 @@ func (idx *Index) deleteDocFullScan(docID string) error {
 
 // GetDocument retrieves a stored document by ID.
 func (idx *Index) GetDocument(docID string) (*document.StoredData, error) {
+	// Fast path: check doc cache (in-memory mode).
+	if fields, ok := idx.cache.GetCachedDoc(docID); ok {
+		return &document.StoredData{Fields: fields}, nil
+	}
+
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 
@@ -547,11 +738,22 @@ func (idx *Index) GetDocument(docID string) (*document.StoredData, error) {
 	if err != nil {
 		return nil, fmt.Errorf("document not found: %s", docID)
 	}
-	return document.UnmarshalStoredData([]byte(val))
+	sd, err := document.UnmarshalStoredData([]byte(val))
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache if in-memory mode.
+	if idx.inMemoryMode {
+		idx.cache.SetCachedDoc(docID, sd.Fields)
+	}
+
+	return sd, nil
 }
 
 // DocCount returns the total number of indexed documents.
 func (idx *Index) DocCount() (uint64, error) {
+	// Fast path: check cache without index lock.
 	if v, ok := idx.cache.GetDocCount(); ok {
 		return uint64(v), nil
 	}
@@ -579,9 +781,13 @@ func (idx *Index) getDocCount() (uint64, error) {
 
 // TermPostings retrieves all postings for a term in a field.
 func (idx *Index) TermPostings(field, term string) ([]Posting, error) {
+	// Fast path: check cache without index lock.
+	if cached := idx.cache.GetPostings(field, term); cached != nil {
+		return cached, nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.termPostings(field, term)
+	return idx.cachedTermPostings(field, term)
 }
 
 func (idx *Index) termPostings(field, term string) ([]Posting, error) {
@@ -595,21 +801,28 @@ const termListBatchSize = 1000
 // TermsForField returns all unique terms in a field.
 // Uses the in-memory term dictionary cache to avoid repeated KV scans.
 func (idx *Index) TermsForField(field string) ([]string, error) {
+	// Fast path: check cache without index lock.
+	if cached := idx.cache.GetTermDict(field); cached != nil {
+		return cached, nil
+	}
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.cachedTermsForField(field)
 }
 
 // TermsWithPrefix returns all terms in a field starting with the given prefix.
-// TermsWithPrefix returns all terms in a field starting with the given prefix.
 // Uses the cached term dictionary with binary search for O(log N + results).
 func (idx *Index) TermsWithPrefix(field, termPrefix string) ([]string, error) {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-
-	allTerms, err := idx.cachedTermsForField(field)
-	if err != nil {
-		return nil, err
+	// Fast path: check cache without index lock.
+	allTerms := idx.cache.GetTermDict(field)
+	if allTerms == nil {
+		idx.mu.RLock()
+		var err error
+		allTerms, err = idx.cachedTermsForField(field)
+		idx.mu.RUnlock()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Binary search to find the start of matching terms.
@@ -624,8 +837,10 @@ func (idx *Index) TermsWithPrefix(field, termPrefix string) ([]string, error) {
 	return result, nil
 }
 
+
 // DocumentFrequency returns the number of documents containing a term in a field.
 func (idx *Index) DocumentFrequency(field, term string) (uint64, error) {
+	// Fast path: check cache without index lock.
 	if v, ok := idx.cache.GetDocFreq(field, term); ok {
 		return v, nil
 	}
@@ -669,6 +884,7 @@ func (idx *Index) decrementDocFreq(field, term string) error {
 
 // FieldLength returns the length (token count) of a field in a document.
 func (idx *Index) FieldLength(field, docID string) (int, error) {
+	// Fast path: check cache without index lock.
 	if v, ok := idx.cache.GetFieldLen(field, docID); ok {
 		return v, nil
 	}
@@ -723,6 +939,7 @@ func (idx *Index) BatchFieldLengths(field string, docIDs []string) {
 
 // AverageFieldLength returns the average field length across all documents.
 func (idx *Index) AverageFieldLength(field string) (float64, error) {
+	// Fast path: check cache without index lock.
 	if v, ok := idx.cache.GetAvgFieldLen(field); ok {
 		return v, nil
 	}
@@ -766,6 +983,7 @@ func (idx *Index) getInt64(key string) (int64, error) {
 
 // GetTermVector retrieves term vectors for a specific field/doc/term.
 func (idx *Index) GetTermVector(field, docID, term string) (*TermVector, error) {
+	// Fast path: check cache without index lock.
 	if tv, ok := idx.cache.GetTermVec(field, docID, term); ok {
 		return tv, nil
 	}

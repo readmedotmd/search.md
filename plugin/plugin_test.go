@@ -157,6 +157,12 @@ func (m *mockIndexReader) HNSWSearch(field string, query []float32, k int) ([]st
 	return nil, nil, false
 }
 func (m *mockIndexReader) BatchFieldLengths(field string, docIDs []string) {}
+func (m *mockIndexReader) GetTermSearcherState(field, term string) index.TermSearcherState {
+	return index.TermSearcherState{}
+}
+func (m *mockIndexReader) BatchGetFieldLengths(field string, docIDs []string) (map[string]int, bool) {
+	return make(map[string]int), true
+}
 
 // ===========================================================================
 // HTML Highlighter Tests

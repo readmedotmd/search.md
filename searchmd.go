@@ -130,6 +130,20 @@ func (si *SearchIndex) SetLogger(l index.Logger) {
 	si.idx.SetLogger(l)
 }
 
+// SetInMemoryMode enables or disables in-memory mode on the underlying index.
+// When enabled, the postings cache has no LRU eviction limit and WarmCache()
+// can be used to eagerly preload all index data for maximum query performance.
+func (si *SearchIndex) SetInMemoryMode(enabled bool) {
+	si.idx.SetInMemoryMode(enabled)
+}
+
+// WarmCache eagerly preloads all term dictionaries, posting lists,
+// document frequencies, field lengths, and aggregate statistics into memory.
+// Most effective after calling SetInMemoryMode(true).
+func (si *SearchIndex) WarmCache() error {
+	return si.idx.WarmCache()
+}
+
 // Close releases resources held by the index. After calling Close,
 // further operations on the index will panic. The underlying store
 // is NOT closed; the caller is responsible for closing it.
@@ -251,6 +265,9 @@ func (b *Batch) Delete(id string) {
 func (b *Batch) Execute() error {
 	b.si.mu.Lock()
 	defer b.si.mu.Unlock()
+	// Enable batch mode to defer per-document cache invalidation.
+	b.si.idx.BeginBatch()
+	defer b.si.idx.EndBatch()
 	for _, op := range b.ops {
 		if op.isDelete {
 			if err := b.si.deleteInternal(op.id); err != nil {

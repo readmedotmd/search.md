@@ -75,8 +75,9 @@ func porterStem(word string) string {
 		word = word[:len(word)-2] // sses -> ss
 	} else if strings.HasSuffix(word, "ies") && len(word) > 4 {
 		word = word[:len(word)-2] // ies -> i (but not for 4-letter words like "ties")
-	} else if !strings.HasSuffix(word, "ss") && strings.HasSuffix(word, "s") && len(word) > 3 {
-		word = word[:len(word)-1] // s ->  (but not ss)
+	} else if !strings.HasSuffix(word, "ss") && !strings.HasSuffix(word, "us") &&
+		!strings.HasSuffix(word, "is") && strings.HasSuffix(word, "s") && len(word) > 3 {
+		word = word[:len(word)-1] // s ->  (but not ss, us, is)
 	}
 
 	// Step 1b: -eed, -ed, -ing

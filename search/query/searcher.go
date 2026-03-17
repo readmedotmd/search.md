@@ -32,28 +32,59 @@ type termSearcher struct {
 }
 
 func newTermSearcher(reader plugin.IndexReader, field, term string, boost float64, sf plugin.ScorerFactory) (*termSearcher, error) {
-	postings, err := reader.TermPostings(field, term)
-	if err != nil {
-		return nil, err
+	// Try coalesced cache read first (single lock acquisition for all state).
+	st := reader.GetTermSearcherState(field, term)
+
+	var postings []index.Posting
+	var docCount uint64
+	var docFreq uint64
+	var avgFieldLen float64
+
+	if st.PostingsOK {
+		postings = st.Postings
+	} else {
+		var err error
+		postings, err = reader.TermPostings(field, term)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(postings) == 0 {
+		return &termSearcher{}, nil
 	}
 
-	docCount, _ := reader.DocCount()
-	docFreq, _ := reader.DocumentFrequency(field, term)
-	avgFieldLen, _ := reader.AverageFieldLength(field)
+	if st.DocCountOK {
+		docCount = uint64(st.DocCount)
+	} else {
+		docCount, _ = reader.DocCount()
+	}
+	if st.DocFreqOK {
+		docFreq = st.DocFreq
+	} else {
+		docFreq, _ = reader.DocumentFrequency(field, term)
+	}
+	if st.AvgFieldOK {
+		avgFieldLen = st.AvgFieldLen
+	} else {
+		avgFieldLen, _ = reader.AverageFieldLength(field)
+	}
 
 	s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 
-	// Batch-preload field lengths to avoid N individual KV lookups.
+	// Batch-fetch field lengths in one call to minimize lock acquisitions.
+	// Reuse postings slice to extract docIDs without extra allocation.
 	docIDs := make([]string, len(postings))
 	for i, p := range postings {
 		docIDs[i] = p.DocID
 	}
-	reader.BatchFieldLengths(field, docIDs)
+	fieldLens, _ := reader.BatchGetFieldLengths(field, docIDs)
 
-	// Pre-allocate as values, not pointers, to reduce allocations.
-	scored := make([]plugin.DocumentScore, len(postings))
+	// Score all postings into a single backing slice, then build pointer slice.
+	n := len(postings)
+	scored := make([]plugin.DocumentScore, n)
+	results := make([]*plugin.DocumentScore, n)
 	for i, p := range postings {
-		fieldLen, _ := reader.FieldLength(field, p.DocID)
+		fieldLen := fieldLens[p.DocID]
 		if fieldLen == 0 {
 			fieldLen = 1
 		}
@@ -61,16 +92,12 @@ func newTermSearcher(reader plugin.IndexReader, field, term string, boost float6
 			ID:    p.DocID,
 			Score: s.Score(p.Frequency, fieldLen, boost),
 		}
-	}
-
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
-	})
-
-	results := make([]*plugin.DocumentScore, len(scored))
-	for i := range scored {
 		results[i] = &scored[i]
 	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
 
 	return &termSearcher{results: results}, nil
 }
@@ -109,12 +136,12 @@ func newPhraseSearcher(reader plugin.IndexReader, field string, terms []string, 
 	avgFieldLen, _ := reader.AverageFieldLength(field)
 	s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 
-	// Batch-preload field lengths for all candidate documents.
+	// Batch-fetch field lengths for all candidate documents.
 	candidateDocIDs := make([]string, len(firstPostings))
 	for i, fp := range firstPostings {
 		candidateDocIDs[i] = fp.DocID
 	}
-	reader.BatchFieldLengths(field, candidateDocIDs)
+	fieldLens, _ := reader.BatchGetFieldLengths(field, candidateDocIDs)
 
 	var scored []plugin.DocumentScore
 
@@ -122,7 +149,7 @@ func newPhraseSearcher(reader plugin.IndexReader, field string, terms []string, 
 		docID := fp.DocID
 
 		if containsPhrase(reader, field, docID, terms) {
-			fieldLen, _ := reader.FieldLength(field, docID)
+			fieldLen := fieldLens[docID]
 			scored = append(scored, plugin.DocumentScore{
 				ID:    docID,
 				Score: s.Score(fp.Frequency, fieldLen, boost),
@@ -318,22 +345,32 @@ func scoreMultiTerms(reader plugin.IndexReader, field string, terms []string, bo
 		scorer   plugin.Scorer
 	}
 	pairs := make([]termPostingPair, 0, len(terms))
-	var allDocIDs []string
+	totalPostings := 0
 	for _, term := range terms {
 		postings, _ := reader.TermPostings(field, term)
 		docFreq, _ := reader.DocumentFrequency(field, term)
 		s := sf.NewScorer(docCount, docFreq, avgFieldLen)
 		pairs = append(pairs, termPostingPair{postings: postings, scorer: s})
-		for _, p := range postings {
-			allDocIDs = append(allDocIDs, p.DocID)
+		totalPostings += len(postings)
+	}
+
+	// Batch-preload field lengths using a deduplicated list.
+	allDocIDs := make([]string, 0, totalPostings)
+	seen := make(map[string]struct{}, totalPostings)
+	for _, pair := range pairs {
+		for _, p := range pair.postings {
+			if _, ok := seen[p.DocID]; !ok {
+				seen[p.DocID] = struct{}{}
+				allDocIDs = append(allDocIDs, p.DocID)
+			}
 		}
 	}
-	reader.BatchFieldLengths(field, allDocIDs)
+	fieldLens, _ := reader.BatchGetFieldLengths(field, allDocIDs)
 
 	docScores := make(map[string]float64, len(allDocIDs))
 	for _, pair := range pairs {
 		for _, p := range pair.postings {
-			fieldLen, _ := reader.FieldLength(field, p.DocID)
+			fieldLen := fieldLens[p.DocID]
 			if fieldLen == 0 {
 				fieldLen = 1
 			}
@@ -565,6 +602,59 @@ func newDisjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		return &disjunctionSearcher{}, nil
 	}
 
+	// For single query with minMatch=1, skip the count tracking entirely.
+	if len(queries) == 1 && minMatch <= 1 {
+		s, err := queries[0].Searcher(reader, field, sf)
+		if err != nil {
+			return nil, err
+		}
+		var results []*plugin.DocumentScore
+		for {
+			ds, err := s.Next()
+			if err != nil || ds == nil {
+				break
+			}
+			score := ds.Score * boost
+			results = append(results, &plugin.DocumentScore{ID: ds.ID, Score: score})
+		}
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Score > results[j].Score
+		})
+		return &disjunctionSearcher{results: results}, nil
+	}
+
+	// For minMatch=1 (the common case), we don't need docCounts at all.
+	if minMatch <= 1 {
+		docScores := make(map[string]float64)
+		for _, q := range queries {
+			s, err := q.Searcher(reader, field, sf)
+			if err != nil {
+				return nil, err
+			}
+			for {
+				ds, err := s.Next()
+				if err != nil || ds == nil {
+					break
+				}
+				docScores[ds.ID] += ds.Score
+			}
+		}
+
+		scored := make([]plugin.DocumentScore, 0, len(docScores))
+		for docID, score := range docScores {
+			scored = append(scored, plugin.DocumentScore{ID: docID, Score: score * boost})
+		}
+		sort.Slice(scored, func(i, j int) bool {
+			return scored[i].Score > scored[j].Score
+		})
+		results := make([]*plugin.DocumentScore, len(scored))
+		for i := range scored {
+			results[i] = &scored[i]
+		}
+		return &disjunctionSearcher{results: results}, nil
+	}
+
+	// General case: need to track match counts.
 	docScores := make(map[string]float64)
 	docCounts := make(map[string]int)
 
@@ -573,34 +663,37 @@ func newDisjunctionSearcher(reader plugin.IndexReader, field string, queries []Q
 		if err != nil {
 			return nil, err
 		}
-		seen := make(map[string]bool)
+		seen := make(map[string]struct{})
 		for {
 			ds, err := s.Next()
 			if err != nil || ds == nil {
 				break
 			}
-			if !seen[ds.ID] {
-				seen[ds.ID] = true
+			if _, ok := seen[ds.ID]; !ok {
+				seen[ds.ID] = struct{}{}
 				docCounts[ds.ID]++
 			}
 			docScores[ds.ID] += ds.Score
 		}
 	}
 
-	results := make([]*plugin.DocumentScore, 0)
+	scored := make([]plugin.DocumentScore, 0, len(docCounts))
 	for docID, count := range docCounts {
 		if count >= minMatch {
-			results = append(results, &plugin.DocumentScore{
+			scored = append(scored, plugin.DocumentScore{
 				ID:    docID,
 				Score: docScores[docID] * boost,
 			})
 		}
 	}
-
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
 	})
 
+	results := make([]*plugin.DocumentScore, len(scored))
+	for i := range scored {
+		results[i] = &scored[i]
+	}
 	return &disjunctionSearcher{results: results}, nil
 }
 

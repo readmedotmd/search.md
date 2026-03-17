@@ -45,6 +45,14 @@ type Cache struct {
 
 	// termVecs caches term vectors per field+docID+term.
 	termVecs map[string]*TermVector
+
+	// docs caches unmarshaled stored documents. Only populated in in-memory mode.
+	docs       map[string]*cachedDoc
+	docsLoaded bool // true when all documents have been cached
+}
+
+type cachedDoc struct {
+	fields map[string]interface{}
 }
 
 const defaultMaxPostings = 1024
@@ -60,7 +68,22 @@ func newCache() *Cache {
 		avgFieldLen:     make(map[string]float64),
 		docCount:        -1,
 		termVecs:        make(map[string]*TermVector),
+		docs:            make(map[string]*cachedDoc),
 	}
+}
+
+// SetUnlimitedPostings removes the LRU eviction limit on the postings cache.
+func (c *Cache) SetUnlimitedPostings() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxPostings = 0 // 0 means unlimited
+}
+
+// SetMaxPostings sets the maximum number of entries in the postings cache.
+func (c *Cache) SetMaxPostings(max int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxPostings = max
 }
 
 func postingsCacheKey(field, term string) string {
@@ -96,11 +119,13 @@ func (c *Cache) SetPostings(field, term string, postings []Posting) {
 	key := postingsCacheKey(field, term)
 	if _, exists := c.postings[key]; !exists {
 		c.postingsLRU = append(c.postingsLRU, key)
-		// Evict oldest if over capacity.
-		for len(c.postingsLRU) > c.maxPostings {
-			evict := c.postingsLRU[0]
-			c.postingsLRU = c.postingsLRU[1:]
-			delete(c.postings, evict)
+		// Evict oldest if over capacity (skip when maxPostings==0 i.e. unlimited).
+		if c.maxPostings > 0 {
+			for len(c.postingsLRU) > c.maxPostings {
+				evict := c.postingsLRU[0]
+				c.postingsLRU = c.postingsLRU[1:]
+				delete(c.postings, evict)
+			}
 		}
 	}
 	c.postings[key] = postings
@@ -224,6 +249,89 @@ func (c *Cache) SetDocCount(count int64) {
 	c.docCount = count
 }
 
+// TermSearcherState holds all cached state needed by a term searcher,
+// fetched in a single lock acquisition to reduce contention.
+type TermSearcherState struct {
+	Postings    []Posting
+	DocFreq     uint64
+	AvgFieldLen float64
+	DocCount    int64
+	PostingsOK  bool
+	DocFreqOK   bool
+	AvgFieldOK  bool
+	DocCountOK  bool
+}
+
+// GetTermSearcherState fetches postings, docFreq, avgFieldLen, and docCount
+// for a field+term under a single read lock to minimize lock contention.
+func (c *Cache) GetTermSearcherState(field, term string) TermSearcherState {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := postingsCacheKey(field, term)
+	var st TermSearcherState
+	st.Postings = c.postings[key]
+	st.PostingsOK = st.Postings != nil
+	st.DocFreq, st.DocFreqOK = c.docFreqs[key]
+	st.AvgFieldLen, st.AvgFieldOK = c.avgFieldLen[field]
+	if c.docCount >= 0 {
+		st.DocCount = c.docCount
+		st.DocCountOK = true
+	}
+	return st
+}
+
+// GetFieldLenBatch retrieves field lengths for multiple docIDs under a single lock.
+// Returns a map and a bool indicating if all requested docIDs were found in cache.
+// When all field lengths are bulk-loaded, returns the inner map directly (no copy).
+func (c *Cache) GetFieldLenBatch(field string, docIDs []string) (map[string]int, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	m, ok := c.fieldLens[field]
+	if !ok {
+		return nil, false
+	}
+	// If bulk-loaded, return the inner map directly — no allocation needed.
+	if c.fieldLensLoaded[field] {
+		return m, true
+	}
+	result := make(map[string]int, len(docIDs))
+	allFound := true
+	for _, docID := range docIDs {
+		if v, found := m[docID]; found {
+			result[docID] = v
+		} else {
+			allFound = false
+		}
+	}
+	return result, allFound
+}
+
+// GetCachedDoc returns a cached document's fields, or nil if not cached.
+func (c *Cache) GetCachedDoc(docID string) (map[string]interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	d, ok := c.docs[docID]
+	if !ok {
+		return nil, false
+	}
+	return d.fields, true
+}
+
+// SetCachedDoc caches a document's fields.
+func (c *Cache) SetCachedDoc(docID string, fields map[string]interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.docs[docID] = &cachedDoc{fields: fields}
+}
+
+// InvalidateDoc removes a cached document.
+func (c *Cache) InvalidateDoc(docID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.docs, docID)
+	c.docsLoaded = false
+}
+
 // InvalidateField clears all caches for a field (called on writes).
 func (c *Cache) InvalidateField(field string) {
 	c.mu.Lock()
@@ -304,6 +412,8 @@ func (c *Cache) InvalidateAll() {
 	c.avgFieldLen = make(map[string]float64)
 	c.docCount = -1
 	c.termVecs = make(map[string]*TermVector)
+	c.docs = make(map[string]*cachedDoc)
+	c.docsLoaded = false
 }
 
 // --- Integration with Index ---

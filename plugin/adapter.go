@@ -103,3 +103,11 @@ func (a *IndexAdapter) HNSWSearch(field string, query []float32, k int) ([]strin
 func (a *IndexAdapter) BatchFieldLengths(field string, docIDs []string) {
 	a.Idx.BatchFieldLengths(field, docIDs)
 }
+
+func (a *IndexAdapter) GetTermSearcherState(field, term string) index.TermSearcherState {
+	return a.Idx.GetTermSearcherState(field, term)
+}
+
+func (a *IndexAdapter) BatchGetFieldLengths(field string, docIDs []string) (map[string]int, bool) {
+	return a.Idx.BatchGetFieldLengths(field, docIDs)
+}

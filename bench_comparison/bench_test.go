@@ -71,6 +71,11 @@ func newSearchMDIndex(b *testing.B, n int) *searchmd.SearchIndex {
 			b.Fatalf("search.md index doc%d: %v", i, err)
 		}
 	}
+	// Enable in-memory mode and warm the cache for query benchmarks.
+	idx.SetInMemoryMode(true)
+	if err := idx.WarmCache(); err != nil {
+		b.Fatalf("search.md WarmCache: %v", err)
+	}
 	return idx
 }
 

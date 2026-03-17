@@ -50,6 +50,14 @@ type IndexReader interface {
 
 	// Batch operations for performance
 	BatchFieldLengths(field string, docIDs []string)
+
+	// GetTermSearcherState fetches postings, docFreq, avgFieldLen, and docCount
+	// for a field+term in a single coalesced cache read to minimize lock contention.
+	GetTermSearcherState(field, term string) index.TermSearcherState
+
+	// BatchGetFieldLengths returns field lengths for multiple docIDs in one call.
+	// Returns a map and whether all requested docIDs were found in cache.
+	BatchGetFieldLengths(field string, docIDs []string) (map[string]int, bool)
 }
 
 // Scorer computes relevance scores for matched documents.
